@@ -52,7 +52,7 @@ std::string baseName(const std::string& path) {
  * It is necessary to limit the sending of the same parts for a while
  * This container contains part number and time when the part was sent
  */
-std::map<size_t, long> sent_part;
+std::map<size_t, int64_t> sent_part;
 
 void sendPart(size_t part_index) {
     size_t offset        = part_index * static_cast<size_t>(mtu);
@@ -172,7 +172,7 @@ void sendNewPacket() {
 
 // Serve RESEND requests until ttl expires, re-announcing FINISH periodically.
 void serveResends(size_t total_parts) {
-    long lastFinishSendTime = 0;
+    int64_t lastFinishSendTime = 0;
 
     SOCKADDR_IN sender_address;
     memset(&sender_address, 0, sizeof(sender_address));
@@ -203,7 +203,7 @@ void serveResends(size_t total_parts) {
         if (part >= total_parts) continue;
 
         auto epoch    = std::chrono::system_clock::now().time_since_epoch();
-        long duration = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
+        int64_t duration = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
 
         ttl = ttl_max;
 
