@@ -72,7 +72,7 @@ run_test() {
     sleep 0.5
 
     echo "==> [$label] starting receiver (bind=$RECV_BIND, target=$PROXY_BACK_IN)"
-    "$BINARY" --type receiver --file "$dst" --broadcast 127.0.0.1 \
+    "$BINARY" receive "$dst" --to 127.0.0.1 \
               --bind-port "$RECV_BIND" --port "$PROXY_BACK_IN" \
               --ttl 15 --delay-ms 0 \
         > "$recv_log" 2>&1 &
@@ -80,7 +80,7 @@ run_test() {
     sleep 1
 
     echo "==> [$label] starting sender (bind=$SEND_BIND, target=$PROXY_FWD_IN)"
-    if ! "$BINARY" --type sender --file "$src" --broadcast 127.0.0.1 \
+    if ! "$BINARY" send "$src" --to 127.0.0.1 \
                    --bind-port "$SEND_BIND" --port "$PROXY_FWD_IN" \
                    --ttl 10 --delay-ms 0 \
             > "$send_log" 2>&1; then
