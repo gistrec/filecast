@@ -102,8 +102,8 @@ std::string sanitizeName(const std::string& raw) {
 // Validate and store one TRANSFER packet. Returns true when a new part was
 // stored (shared by the main loop and the recovery loop so their validation
 // can never drift apart).
-bool handleTransfer(const char* buf, long length) {
-    if (length < static_cast<long>(TRANSFER_HEADER)) return false;
+bool handleTransfer(const char* buf, int64_t length) {
+    if (length < static_cast<int64_t>(TRANSFER_HEADER)) return false;
     if (Utils::getNumberFromBytes(buf + 8, 4) != session_id) return false;
 
     size_t part  = Utils::getNumberFromBytes(buf + 12, 4);
@@ -206,7 +206,7 @@ int checkParts() {
                                    &sender_address_length);
             if (length <= 0) break;                              // queue drained this round
             if (strncmp(buffer, "TRANSFER", 8) != 0) continue;   // e.g. our own RESEND
-            if (handleTransfer(buffer, static_cast<long>(length))) progressed = true;
+            if (handleTransfer(buffer, static_cast<int64_t>(length))) progressed = true;
         }
 
         // A new part refreshes ttl; a round with no progress counts down toward
@@ -258,8 +258,8 @@ bool announceValid(size_t announced, size_t chunk, int& exit_code) {
 // Parse and latch a NEW_PACKET. Sets exit_code and returns false if the caller
 // should return that code; returns true to continue the receive loop. buf may be
 // reallocated to fit the announced chunk size.
-bool handleNewPacket(char*& buf, size_t& bufcap, long length, int& exit_code) {
-    if (length < static_cast<long>(NEW_PACKET_FIXED)) return true;  // too short, ignore
+bool handleNewPacket(char*& buf, size_t& bufcap, int64_t length, int& exit_code) {
+    if (length < static_cast<int64_t>(NEW_PACKET_FIXED)) return true;  // too short, ignore
     if (Utils::getNumberFromBytes(buf + 10, 2) != PROTOCOL_VERSION) {
         std::cerr << "Warning: ignoring NEW_PACKET with unsupported protocol version" << std::endl;
         return true;
@@ -327,7 +327,7 @@ bool handleNewPacket(char*& buf, size_t& bufcap, long length, int& exit_code) {
 
 
 // Latch the "sender finished" state from a FINISH packet for our session.
-void handleFinish(const char* buf, long length, bool& finish) {
+void handleFinish(const char* buf, int64_t length, bool& finish) {
     if (length < 10) return;
     if (Utils::getNumberFromBytes(buf + 6, 4) != session_id) return;
     ttl = ttl_max;
@@ -379,16 +379,16 @@ int run() {
 
         if (strncmp(buffer, "NEW_PACKET", 10) == 0) {
             int exit_code = 0;
-            if (!handleNewPacket(buffer, bufcap, static_cast<long>(length), exit_code)) {
+            if (!handleNewPacket(buffer, bufcap, static_cast<int64_t>(length), exit_code)) {
                 delete[] buffer;
                 delete[] file;
                 file = nullptr;
                 return exit_code;
             }
         } else if (strncmp(buffer, "TRANSFER", 8) == 0 && file != nullptr) {
-            if (handleTransfer(buffer, static_cast<long>(length))) ttl = ttl_max;
+            if (handleTransfer(buffer, static_cast<int64_t>(length))) ttl = ttl_max;
         } else if (strncmp(buffer, "FINISH", 6) == 0) {
-            handleFinish(buffer, static_cast<long>(length), finish);
+            handleFinish(buffer, static_cast<int64_t>(length), finish);
         }
     }
     // ttl exhausted before FINISH: the transfer did not complete.
