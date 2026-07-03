@@ -3,18 +3,21 @@
 
 #include "Utils.hpp"
 
+#include <cstdint>
 #include <string>
 
 
 extern std::string fileName;     // File Name to transfer or receive
 extern bool        fileNameFromCli; // true if the user gave an explicit output name
+extern bool        verbose;      // per-packet logging instead of a progress bar
+extern bool        overwrite;    // allow overwriting an existing output file
 
 extern int mtu;     // Max packet size to send and receive
 
 extern int ttl;     // Current wait time for new packages before shutting down
 extern int ttl_max; // Maximum wait time for new packages before shutting down
 
-extern int delay_ms; // Inter-packet pause when blasting parts / RESENDs
+extern int64_t pace_us; // Inter-packet pause in microseconds (from --rate/--delay-ms)
 
 extern SOCKET _socket;
 

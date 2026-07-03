@@ -33,11 +33,14 @@ struct CliOptions {
     int         ttl       = 15;
     int         port      = 33333;
     int         bind_port = 33333;
-    int         delay_ms  = 20;
+    int         rate      = 100;        // target send rate, Mbit/s
+    int64_t     pace_us   = 0;          // inter-packet pause derived from rate/delay
     std::string file;
     bool        file_from_cli = false;  // true if the user named the file
-    bool        use_broadcast = true;  // false when --to <ip> is given
-    std::string target;                // destination IP for unicast
+    bool        use_broadcast = true;   // false when --to <ip> is given
+    std::string target;                 // destination IP for unicast
+    bool        verbose   = false;      // per-packet logging instead of a bar
+    bool        overwrite = false;      // allow overwriting an existing file
 };
 
 void buildOptions(cxxopts::Options& options) {
@@ -53,7 +56,10 @@ void buildOptions(cxxopts::Options& options) {
         ("bind-port", "Local UDP port to bind on",            cxxopts::value<int>()->default_value("33333"))
         ("mtu",       "Max packet size in bytes",             cxxopts::value<int>()->default_value("1500"))
         ("ttl",       "Seconds of silence before giving up",  cxxopts::value<int>()->default_value("15"))
-        ("delay-ms",  "Delay between successive packets, ms", cxxopts::value<int>()->default_value("20"))
+        ("rate",      "Target send rate, Mbit/s",             cxxopts::value<int>()->default_value("100"))
+        ("delay-ms",  "Override inter-packet pause, ms (advanced, overrides --rate)", cxxopts::value<int>())
+        ("v,verbose", "Log every packet instead of a progress bar")
+        ("overwrite", "Overwrite an existing output file")
         ("h,help",    "Print help")
         ("version",   "Print version");
 
@@ -64,11 +70,11 @@ void printUsage(cxxopts::Options& options, std::ostream& os) {
     os << options.help();
     os << "\nCommands:\n"
        << "  send <file>       Broadcast <file> to every host on the LAN\n"
-       << "  receive [file]    Receive a file (saved as [file], default file.out)\n"
+       << "  receive [file]    Receive a file (saved under the sender's name by default)\n"
        << "\nExamples:\n"
        << "  filecast send photo.jpg\n"
        << "  filecast receive\n"
-       << "  filecast send photo.jpg --to 192.168.1.50\n";
+       << "  filecast send photo.jpg --to 192.168.1.50 --rate 500\n";
 }
 
 // Peel the subcommand off argv[1], handling global --help/--version. Sets
@@ -118,8 +124,8 @@ bool validateNumericFlags(const CliOptions& opt) {
         std::cerr << "Error: --bind-port must be between 1 and 65535" << std::endl;
         return false;
     }
-    if (opt.delay_ms < 0) {
-        std::cerr << "Error: --delay-ms must be 0 or greater" << std::endl;
+    if (opt.rate <= 0) {
+        std::cerr << "Error: --rate must be greater than 0" << std::endl;
         return false;
     }
     return true;
@@ -132,9 +138,25 @@ bool collectOptions(const cxxopts::ParseResult& result, bool is_sender, CliOptio
     opt.ttl       = result["ttl"].as<int>();
     opt.port      = result["port"].as<int>();
     opt.bind_port = result["bind-port"].as<int>();
-    opt.delay_ms  = result["delay-ms"].as<int>();
+    opt.rate      = result["rate"].as<int>();
 
     if (!validateNumericFlags(opt)) return false;
+
+    // Pace packets by --rate (Mbit/s); an explicit --delay-ms overrides it (used
+    // by the loopback tests with 0 to blast at full speed).
+    if (result.count("delay-ms")) {
+        int delay_ms = result["delay-ms"].as<int>();
+        if (delay_ms < 0) {
+            std::cerr << "Error: --delay-ms must be 0 or greater" << std::endl;
+            return false;
+        }
+        opt.pace_us = static_cast<int64_t>(delay_ms) * 1000;
+    } else {
+        opt.pace_us = static_cast<int64_t>(opt.mtu) * 8 / opt.rate;
+    }
+
+    opt.verbose   = (result.count("verbose") != 0);
+    opt.overwrite = (result.count("overwrite") != 0);
 
     // send needs an explicit file; receive may take the name from the sender.
     const bool has_file = (result.count("file") != 0);
@@ -159,7 +181,7 @@ int setupSocket(const CliOptions& opt) {
         CLEANUP_NETWORK();
         return 1;
     }
-    std::cout << "Ok: Socket created" << std::endl;
+    if (verbose) std::cout << "Ok: Socket created" << std::endl;
 
     int reuseAddr = 1;
     if (setsockopt(_socket, SOL_SOCKET, SO_REUSEADDR,
@@ -191,7 +213,7 @@ int setupSocket(const CliOptions& opt) {
             std::cerr << "Error: Can't get access to broadcast" << std::endl;
             cleanupAndExit(1);
         }
-        std::cout << "Ok: Got access to broadcast" << std::endl;
+        if (verbose) std::cout << "Ok: Got access to broadcast" << std::endl;
         broadcast_address.sin_addr.s_addr = INADDR_BROADCAST;
     } else {
         if (inet_pton(AF_INET, opt.target.c_str(), &broadcast_address.sin_addr) != 1) {
@@ -204,7 +226,7 @@ int setupSocket(const CliOptions& opt) {
         std::cerr << "Error: Can't bind socket" << std::endl;
         cleanupAndExit(1);
     }
-    std::cout << "Ok: Socket bound" << std::endl;
+    if (verbose) std::cout << "Ok: Socket bound" << std::endl;
 
     #if defined(_WIN32) || defined(_WIN64)
     DWORD tv = 1000;  // user timeout in milliseconds [ms]
@@ -273,9 +295,11 @@ int main(int argc, char* argv[]) {
     mtu             = opt.mtu;
     ttl             = opt.ttl;
     ttl_max         = opt.ttl;
-    delay_ms        = opt.delay_ms;
+    pace_us         = opt.pace_us;
     fileName        = opt.file;
     fileNameFromCli = opt.file_from_cli;
+    verbose         = opt.verbose;
+    overwrite       = opt.overwrite;
 
     int rc = setupSocket(opt);
     if (rc != 0) {

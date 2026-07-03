@@ -72,7 +72,7 @@ run_test() {
     sleep 0.5
 
     echo "==> [$label] starting receiver (bind=$RECV_BIND, target=$PROXY_BACK_IN)"
-    "$BINARY" receive "$dst" --to 127.0.0.1 \
+    "$BINARY" receive "$dst" --to 127.0.0.1 --verbose \
               --bind-port "$RECV_BIND" --port "$PROXY_BACK_IN" \
               --ttl 15 --delay-ms 0 \
         > "$recv_log" 2>&1 &
