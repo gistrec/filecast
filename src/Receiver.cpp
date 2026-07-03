@@ -63,25 +63,23 @@ int checkParts() {
             if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         }
 
+        // Drain every packet already queued (until the socket times out via
+        // SO_RCVTIMEO), applying each valid, wanted TRANSFER. Reading only one
+        // packet per round made recovery O(N^2) in the number of missing parts:
+        // one part recovered per round while re-requesting all of them, so N
+        // losses took ~N^2 * delay to recover and buried the sender's replies.
         SOCKADDR_IN sender_address;
         memset(&sender_address, 0, sizeof(sender_address));
         addr_len sender_address_length = sizeof(sender_address);
-        auto length = recvfrom(_socket, buffer, 2 * mtu, 0,
-                               reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
-        if (length <= 0) {
-            ttl--;
-            continue;
-        }
-
-        // Only a valid, wanted TRANSFER counts as progress and refreshes ttl.
-        // Everything else — most importantly our own broadcast RESENDs looped
-        // back to us by the OS in the default (--broadcast yes, port==bind-port)
-        // configuration — must count down toward the timeout. Otherwise, once
-        // the sender goes away, the receiver never times out: it endlessly
-        // re-requests the same parts and floods the LAN with RESENDs forever.
         bool progressed = false;
-        if (strncmp(buffer, "TRANSFER", 8) == 0) {
+        while (true) {
+            auto length = recvfrom(_socket, buffer, 2 * mtu, 0,
+                                   reinterpret_cast<sockaddr*>(&sender_address),
+                                   &sender_address_length);
+            if (length <= 0) break;                              // queue drained this round
+            if (strncmp(buffer, "TRANSFER", 8) != 0) continue;   // e.g. our own RESEND
+
             size_t part        = Utils::getNumberFromBytes(buffer +  8, 4);
             size_t size        = Utils::getNumberFromBytes(buffer + 12, 4);
             size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
@@ -92,8 +90,8 @@ int checkParts() {
             size_t expected = (part + 1 < total_parts)
                 ? static_cast<size_t>(mtu)
                 : (file_length - part * static_cast<size_t>(mtu));
-            if (part < total_parts && size == expected &&
-                static_cast<size_t>(length) >= size + 16) {
+            if (part < total_parts && parts.find(part) == parts.end() &&
+                size == expected && static_cast<size_t>(length) >= size + 16) {
                 parts.insert(part);
                 memcpy(file + part * static_cast<size_t>(mtu), buffer + 16, size);
                 std::cout << "Receive " << part << " part with size " << size << std::endl;
@@ -101,6 +99,9 @@ int checkParts() {
             }
         }
 
+        // A new part refreshes ttl; a round with no progress counts down toward
+        // the timeout. Our own looped-back RESENDs are not TRANSFERs, so a dead
+        // sender still lets recovery terminate instead of livelocking.
         if (progressed) ttl = ttl_max;
         else            ttl--;
 
