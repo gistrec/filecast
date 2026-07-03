@@ -138,34 +138,33 @@ void run() {
         return;
     }
 
-    while (auto length = recvfrom(_socket, buffer, 2 * mtu, 0,
-                                  reinterpret_cast<sockaddr*>(&server_address),
-                                  &server_address_length)) {
-        // Sender is no longer available
-        if (ttl <= 0) {
-            delete[] buffer;
-            delete[] file;
-            file = nullptr;
-            return;
-        }
-
-        // Got FINISH but never received NEW_PACKET — joined too late or sender
-        // misbehaving. Bail with an error rather than waiting for ttl to drain.
-        if (finish && file == nullptr) {
+    while (ttl > 0) {
+        // Sender finished transferring — move to the recovery phase (or bail if
+        // we joined too late to ever have received NEW_PACKET).
+        if (finish) {
+            if (file != nullptr) {
+                delete[] buffer;
+                checkParts();
+                return;
+            }
             std::cerr << "Error: Received FINISH without NEW_PACKET — joined too late" << std::endl;
             delete[] buffer;
             return;
         }
 
-        // If Sender finished transferring, check missing parts
-        if (finish && file != nullptr) {
-            delete[] buffer;
-            checkParts();
-            return;
-        }
+        auto length = recvfrom(_socket, buffer, 2 * mtu, 0,
+                               reinterpret_cast<sockaddr*>(&server_address),
+                               &server_address_length);
 
-        if (length <= 0) {
+        // Timeout (SO_RCVTIMEO) or socket error: count down toward giving up.
+        if (length < 0) {
             ttl--;
+            continue;
+        }
+        // A zero-length datagram is a valid UDP event; ignore it. Using the
+        // recvfrom return value as the loop condition previously let any host
+        // terminate the receiver (exit 0, no file written) with one empty packet.
+        if (length == 0) {
             continue;
         }
 
