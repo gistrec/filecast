@@ -35,6 +35,7 @@ struct CliOptions {
     int         bind_port = 33333;
     int         delay_ms  = 20;
     std::string file;
+    bool        file_from_cli = false;  // true if the user named the file
     bool        use_broadcast = true;  // false when --to <ip> is given
     std::string target;                // destination IP for unicast
 };
@@ -135,12 +136,14 @@ bool collectOptions(const cxxopts::ParseResult& result, bool is_sender, CliOptio
 
     if (!validateNumericFlags(opt)) return false;
 
-    // send needs an explicit file; receive defaults to file.out.
-    if (is_sender && result.count("file") == 0) {
+    // send needs an explicit file; receive may take the name from the sender.
+    const bool has_file = (result.count("file") != 0);
+    if (is_sender && !has_file) {
         std::cerr << "Error: no file to send.\nUsage: filecast send <file>" << std::endl;
         return false;
     }
-    opt.file = (result.count("file") != 0) ? result["file"].as<std::string>() : "file.out";
+    opt.file          = has_file ? result["file"].as<std::string>() : std::string();
+    opt.file_from_cli = has_file;
 
     opt.use_broadcast = (result.count("to") == 0);
     opt.target = opt.use_broadcast ? std::string() : result["to"].as<std::string>();
@@ -267,11 +270,12 @@ int main(int argc, char* argv[]) {
     }
     #endif
 
-    mtu      = opt.mtu;
-    ttl      = opt.ttl;
-    ttl_max  = opt.ttl;
-    delay_ms = opt.delay_ms;
-    fileName = opt.file;
+    mtu             = opt.mtu;
+    ttl             = opt.ttl;
+    ttl_max         = opt.ttl;
+    delay_ms        = opt.delay_ms;
+    fileName        = opt.file;
+    fileNameFromCli = opt.file_from_cli;
 
     int rc = setupSocket(opt);
     if (rc != 0) {

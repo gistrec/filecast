@@ -89,7 +89,14 @@ run_test() {
         return 1
     fi
 
-    echo "PASS: [$label] $size_kb KiB transferred and matches source"
+    # The receiver must have verified the SHA-256 the sender announced.
+    if ! grep -q "sha256 verified" "$recv_log"; then
+        echo "FAIL: [$label] receiver did not verify the file checksum"
+        tail -20 "$recv_log"
+        return 1
+    fi
+
+    echo "PASS: [$label] $size_kb KiB transferred, checksum verified"
 }
 
 # Args: label, size_kb, recv_bind_port, send_bind_port, recv_ttl, send_ttl

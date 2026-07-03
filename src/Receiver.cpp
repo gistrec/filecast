@@ -1,5 +1,6 @@
 #include "Utils.hpp"
 #include "Config.hpp"
+#include "Sha256.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -7,6 +8,10 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cstdint>
+#include <cctype>
+#include <string>
+#include <algorithm>
 #include <vector>
 #include <set>
 
@@ -20,6 +25,14 @@ namespace Receiver {
 // only if you know the receiver has enough memory.
 constexpr size_t MAX_FILE_LENGTH = 4ULL * 1024 * 1024 * 1024; // 4 GiB
 
+// Wire protocol the receiver speaks; a NEW_PACKET with any other version is
+// rejected rather than misparsed.
+constexpr uint16_t PROTOCOL_VERSION = 2;
+
+// NEW_PACKET v2 fixed header (see Sender.cpp) and the TRANSFER header size.
+constexpr size_t NEW_PACKET_FIXED = 58;
+constexpr size_t TRANSFER_HEADER  = 20;
+
 // Session the receiver is currently bound to. The sender stamps a random id into
 // every packet; we latch it from the first NEW_PACKET and then reject packets
 // from any other session, so a second sender (or a restarted one) cannot mix a
@@ -27,21 +40,126 @@ constexpr size_t MAX_FILE_LENGTH = 4ULL * 1024 * 1024 * 1024; // 4 GiB
 size_t session_id   = 0;
 bool   have_session = false;
 
+// Chunk size (the sender's MTU) announced in NEW_PACKET. The receiver slices the
+// file by this value rather than its own --mtu, so a sender/receiver MTU
+// mismatch no longer live-locks the transfer.
+size_t chunk_size = 0;
+
+// SHA-256 of the whole file, announced by the sender and checked after reassembly.
+uint8_t expected_hash[32] = {0};
+
+// File name announced by the sender, used when the user did not name the output.
+std::string announced_name;
+
 /**
  * List of received parts
  */
 std::set<size_t> parts;
+
+size_t totalParts() {
+    return (file_length + chunk_size - 1) / chunk_size;
+}
 
 /**
  * Get empty parts
  */
 std::vector<size_t> getEmptyParts() {
     std::vector<size_t> result;
-    size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
+    size_t total_parts = totalParts();
     for (size_t i = 0; i < total_parts; i++) {
         if (parts.find(i) == parts.end()) result.push_back(i);
     }
     return result;
+}
+
+// A Windows reserved device name (CON, NUL, COM1..9, LPT1..9, ...), optionally
+// with an extension. Opening such a name writes to a device, not a file.
+bool isReservedDeviceName(const std::string& name) {
+    std::string stem = name.substr(0, name.find('.'));
+    std::transform(stem.begin(), stem.end(), stem.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL") return true;
+    if (stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) &&
+        stem[3] >= '1' && stem[3] <= '9') {
+        return true;
+    }
+    return false;
+}
+
+// Keep only the base name of a sender-supplied path and refuse anything that
+// could escape the working directory, so a hostile sender cannot make us write
+// elsewhere. Besides '/' and '\\', a ':' on Windows introduces a drive-relative
+// path or an alternate data stream, and reserved names map to devices.
+std::string sanitizeName(const std::string& raw) {
+    size_t slash = raw.find_last_of("/\\");
+    std::string name = (slash == std::string::npos) ? raw : raw.substr(slash + 1);
+    if (name.empty() || name == "." || name == "..") return "file.out";
+    if (name.find(':') != std::string::npos) return "file.out";
+    if (isReservedDeviceName(name)) return "file.out";
+    return name;
+}
+
+// Validate and store one TRANSFER packet. Returns true when a new part was
+// stored (shared by the main loop and the recovery loop so their validation
+// can never drift apart).
+bool handleTransfer(const char* buf, long length) {
+    if (length < static_cast<long>(TRANSFER_HEADER)) return false;
+    if (Utils::getNumberFromBytes(buf + 8, 4) != session_id) return false;
+
+    size_t part  = Utils::getNumberFromBytes(buf + 12, 4);
+    size_t size  = Utils::getNumberFromBytes(buf + 16, 4);
+    size_t total = totalParts();
+    if (part >= total) return false;
+    if (parts.find(part) != parts.end()) return false;
+
+    // For non-final parts size must equal the chunk size; for the final part it
+    // must equal the remaining bytes. Anything else is malformed and would
+    // either silently zero-pad data or write past the file buffer.
+    size_t expected = (part + 1 < total)
+        ? chunk_size
+        : (file_length - part * chunk_size);
+    if (size != expected) return false;
+    if (static_cast<size_t>(length) < size + TRANSFER_HEADER) return false;
+
+    parts.insert(part);
+    memcpy(file + part * chunk_size, buf + TRANSFER_HEADER, size);
+    std::cout << "Receive " << part << " part with size " << size << std::endl;
+    return true;
+}
+
+// Verify the reassembled file against the announced digest and write it out.
+// Returns a process exit code.
+int verifyAndWrite() {
+    uint8_t got[32];
+    Sha256::hash(file, file_length, got);
+    if (memcmp(got, expected_hash, 32) != 0) {
+        std::cerr << "Error: checksum mismatch — received file is corrupt" << std::endl;
+        delete[] file;
+        file = nullptr;
+        return 2;
+    }
+    std::cout << "Ok: sha256 verified " << Sha256::hex(got) << std::endl;
+
+    std::ofstream output(fileName, std::ofstream::binary);
+    if (!output.is_open()) {
+        std::cerr << "Error: Can't open output file " << fileName << std::endl;
+        delete[] file;
+        file = nullptr;
+        return 2;
+    }
+    output.write(file, static_cast<std::streamsize>(file_length));
+    if (!output) {
+        std::cerr << "Error: Failed to write output file " << fileName << std::endl;
+        delete[] file;
+        file = nullptr;
+        return 2;
+    }
+    output.close();
+    std::cout << "File successfully received as " << fileName << std::endl;
+
+    delete[] file;
+    file = nullptr;
+    return 0;
 }
 
 /**
@@ -50,7 +168,8 @@ std::vector<size_t> getEmptyParts() {
  */
 // Returns a process exit code: 0 on success, non-zero on failure.
 int checkParts() {
-    char* buffer = new (std::nothrow) char[2 * mtu];
+    size_t bufcap = std::max(chunk_size + TRANSFER_HEADER, static_cast<size_t>(2048));
+    char* buffer = new (std::nothrow) char[bufcap];
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
         delete[] file;
@@ -82,31 +201,12 @@ int checkParts() {
 
         bool progressed = false;
         while (true) {
-            auto length = recvfrom(_socket, buffer, 2 * mtu, 0,
+            auto length = recvfrom(_socket, buffer, static_cast<int>(bufcap), 0,
                                    reinterpret_cast<sockaddr*>(&sender_address),
                                    &sender_address_length);
             if (length <= 0) break;                              // queue drained this round
             if (strncmp(buffer, "TRANSFER", 8) != 0) continue;   // e.g. our own RESEND
-            if (static_cast<size_t>(length) < 20) continue;
-            if (Utils::getNumberFromBytes(buffer + 8, 4) != session_id) continue;
-
-            size_t part        = Utils::getNumberFromBytes(buffer + 12, 4);
-            size_t size        = Utils::getNumberFromBytes(buffer + 16, 4);
-            size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
-
-            // For non-final parts size must equal MTU; for the final part it must
-            // equal the remaining bytes. Anything else is malformed and would
-            // either silently zero-pad data or write past the file buffer.
-            size_t expected = (part + 1 < total_parts)
-                ? static_cast<size_t>(mtu)
-                : (file_length - part * static_cast<size_t>(mtu));
-            if (part < total_parts && parts.find(part) == parts.end() &&
-                size == expected && static_cast<size_t>(length) >= size + 20) {
-                parts.insert(part);
-                memcpy(file + part * static_cast<size_t>(mtu), buffer + 20, size);
-                std::cout << "Receive " << part << " part with size " << size << std::endl;
-                progressed = true;
-            }
+            if (handleTransfer(buffer, static_cast<long>(length))) progressed = true;
         }
 
         // A new part refreshes ttl; a round with no progress counts down toward
@@ -127,34 +227,122 @@ int checkParts() {
         return 2;
     }
 
-    std::ofstream output(fileName, std::ofstream::binary);
-    if (!output.is_open()) {
-        std::cerr << "Error: Can't open output file " << fileName << std::endl;
-        delete[] file;
-        file = nullptr;
-        return 2;
-    }
-    output.write(file, static_cast<std::streamsize>(file_length));
-    if (!output) {
-        std::cerr << "Error: Failed to write output file " << fileName << std::endl;
-        delete[] file;
-        file = nullptr;
-        return 2;
-    }
-    output.close();
-    std::cout << "File successfully received" << std::endl;
-
-    delete[] file;
-    file = nullptr;
-    return 0;
+    return verifyAndWrite();
 }
 
+// Range-check the announced sizes. Prints and sets exit_code on failure.
+bool announceValid(size_t announced, size_t chunk, int& exit_code) {
+    if (announced == 0) {
+        std::cerr << "Error: Sender announced empty file" << std::endl;
+        exit_code = 2;
+        return false;
+    }
+    if (announced > MAX_FILE_LENGTH) {
+        std::cerr << "Error: Sender announced file size " << announced
+                  << " bytes, exceeds limit of " << MAX_FILE_LENGTH << std::endl;
+        exit_code = 2;
+        return false;
+    }
+    // Chunk size must be in the sender's valid --mtu range. The lower bound
+    // matters for safety: parts = file_length / chunk_size, so a forged chunk
+    // size of 1 would make getEmptyParts() build a multi-billion-entry vector
+    // and OOM/crash the receiver from two tiny packets.
+    if (chunk < 64 || chunk > 65507) {
+        std::cerr << "Error: Sender announced invalid chunk size " << chunk << std::endl;
+        exit_code = 2;
+        return false;
+    }
+    return true;
+}
+
+// Parse and latch a NEW_PACKET. Sets exit_code and returns false if the caller
+// should return that code; returns true to continue the receive loop. buf may be
+// reallocated to fit the announced chunk size.
+bool handleNewPacket(char*& buf, size_t& bufcap, long length, int& exit_code) {
+    if (length < static_cast<long>(NEW_PACKET_FIXED)) return true;  // too short, ignore
+    if (Utils::getNumberFromBytes(buf + 10, 2) != PROTOCOL_VERSION) {
+        std::cerr << "Warning: ignoring NEW_PACKET with unsupported protocol version" << std::endl;
+        return true;
+    }
+
+    size_t incoming_sid = Utils::getNumberFromBytes(buf + 12, 4);
+    // A NEW_PACKET from a different session (a second sender, or our own sender
+    // restarted) must not clobber the transfer already in progress.
+    if (have_session && incoming_sid != session_id) {
+        std::cerr << "Warning: ignoring NEW_PACKET from another sender session" << std::endl;
+        return true;
+    }
+
+    size_t announced   = Utils::getNumberFromBytes(buf + 16, 4);
+    size_t incoming_cs = Utils::getNumberFromBytes(buf + 20, 4);
+    size_t name_len    = Utils::getNumberFromBytes(buf + 56, 2);
+    if (static_cast<size_t>(length) < NEW_PACKET_FIXED + name_len) return true;  // truncated
+
+    // Only a recognised packet from our sender refreshes ttl. Unrecognised
+    // traffic (stray broadcasts, other receivers' RESENDs, garbage) deliberately
+    // does not, so the timeout stays reachable and a hostile or noisy host cannot
+    // keep the receiver alive forever.
+    ttl = ttl_max;
+
+    if (!announceValid(announced, incoming_cs, exit_code)) return false;
+
+    // Duplicate retransmission of the same NEW_PACKET: keep accumulated parts.
+    if (file != nullptr && announced == file_length && incoming_cs == chunk_size) return true;
+
+    session_id   = incoming_sid;
+    have_session = true;
+    file_length  = announced;
+    chunk_size   = incoming_cs;
+    memcpy(expected_hash, buf + 24, 32);
+    announced_name = sanitizeName(std::string(buf + NEW_PACKET_FIXED, name_len));
+    if (!fileNameFromCli) fileName = announced_name;
+
+    // Grow the receive buffer if a TRANSFER for this chunk size would not fit.
+    size_t need = chunk_size + TRANSFER_HEADER;
+    if (need > bufcap) {
+        delete[] buf;
+        bufcap = need;
+        buf = new (std::nothrow) char[bufcap];
+        if (!buf) {
+            std::cerr << "Error: Can't allocate receive buffer" << std::endl;
+            exit_code = 1;
+            return false;
+        }
+    }
+
+    delete[] file;
+    parts.clear();
+    file = new (std::nothrow) char[file_length];
+    if (!file) {
+        std::cerr << "Error: Can't allocate " << file_length << " bytes" << std::endl;
+        exit_code = 1;
+        return false;
+    }
+
+    std::cout << "Receive information about new file: " << fileName
+              << " (" << file_length << " bytes)" << std::endl;
+    std::cout << "Number of parts: " << totalParts() << std::endl;
+    return true;
+}
+
+
+// Latch the "sender finished" state from a FINISH packet for our session.
+void handleFinish(const char* buf, long length, bool& finish) {
+    if (length < 10) return;
+    if (Utils::getNumberFromBytes(buf + 6, 4) != session_id) return;
+    ttl = ttl_max;
+    if (!finish) {
+        std::cout << "Server finished transferring" << std::endl;
+        finish = true;
+    }
+}
 
 // Returns a process exit code: 0 on success, non-zero on failure.
 int run() {
     bool finish = false; // Sender finished transferring
 
-    char* buffer = new (std::nothrow) char[2 * mtu];
+    size_t bufcap = std::max(static_cast<size_t>(2 * mtu), static_cast<size_t>(2048));
+    char* buffer = new (std::nothrow) char[bufcap];
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
         return 1;
@@ -173,7 +361,7 @@ int run() {
             return 2;
         }
 
-        auto length = recvfrom(_socket, buffer, 2 * mtu, 0,
+        auto length = recvfrom(_socket, buffer, static_cast<int>(bufcap), 0,
                                reinterpret_cast<sockaddr*>(&server_address),
                                &server_address_length);
 
@@ -189,84 +377,18 @@ int run() {
             continue;
         }
 
-        if (strncmp(buffer, "NEW_PACKET", 10) == 0 && static_cast<size_t>(length) >= 18) {
-            size_t incoming_sid = Utils::getNumberFromBytes(buffer + 10, 4);
-            // A NEW_PACKET from a different session (a second sender, or our own
-            // sender restarted) must not clobber the transfer already in progress.
-            if (have_session && incoming_sid != session_id) {
-                std::cerr << "Warning: ignoring NEW_PACKET from another sender session" << std::endl;
-                continue;
-            }
-            // Only a recognised packet from our sender refreshes ttl. Unrecognised
-            // traffic (stray broadcasts, other receivers' RESENDs, garbage)
-            // deliberately does not, so the timeout stays reachable and a hostile
-            // or noisy host cannot keep the receiver alive forever.
-            ttl = ttl_max;
-            size_t announced = Utils::getNumberFromBytes(buffer + 14, 4);
-            if (announced == 0) {
-                std::cerr << "Error: Sender announced empty file" << std::endl;
+        if (strncmp(buffer, "NEW_PACKET", 10) == 0) {
+            int exit_code = 0;
+            if (!handleNewPacket(buffer, bufcap, static_cast<long>(length), exit_code)) {
                 delete[] buffer;
-                return 2;
+                delete[] file;
+                file = nullptr;
+                return exit_code;
             }
-            if (announced > MAX_FILE_LENGTH) {
-                std::cerr << "Error: Sender announced file size " << announced
-                          << " bytes, exceeds limit of " << MAX_FILE_LENGTH << std::endl;
-                delete[] buffer;
-                return 2;
-            }
-
-            // Sender retransmits NEW_PACKET a few times for robustness; if we
-            // already have a buffer for the same size, treat this as a
-            // duplicate and keep accumulated parts.
-            if (file != nullptr && announced == file_length) continue;
-
-            session_id   = incoming_sid;
-            have_session = true;
-            file_length  = announced;
-
-            delete[] file;
-            parts.clear();
-            file = new (std::nothrow) char[file_length];
-            if (!file) {
-                std::cerr << "Error: Can't allocate " << file_length << " bytes" << std::endl;
-                delete[] buffer;
-                return 1;
-            }
-            memset(file, 0, file_length);
-
-            std::cout << "Receive information about new file size: " << file_length << std::endl;
-            std::cout << "Number of parts: " << (file_length + mtu - 1) / mtu << std::endl;
         } else if (strncmp(buffer, "TRANSFER", 8) == 0 && file != nullptr) {
-            if (static_cast<size_t>(length) < 20) continue;
-            if (Utils::getNumberFromBytes(buffer + 8, 4) != session_id) continue;
-            size_t part        = Utils::getNumberFromBytes(buffer + 12, 4); // Read section "index"
-            size_t size        = Utils::getNumberFromBytes(buffer + 16, 4); // Read section "size"
-            size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
-
-            if (part >= total_parts) continue;
-            // For non-final parts size must equal MTU; for the final part it must
-            // equal the remaining bytes. Anything else is malformed and would
-            // either silently zero-pad data or write past the file buffer.
-            size_t expected = (part + 1 < total_parts)
-                ? static_cast<size_t>(mtu)
-                : (file_length - part * static_cast<size_t>(mtu));
-            if (size != expected) continue;
-            if (static_cast<size_t>(length) < size + 20) continue;
-
-            ttl = ttl_max;
-            parts.insert(part);
-            std::cout << "Receive " << part << " part with size " << size << std::endl;
-
-            memcpy(file + part * static_cast<size_t>(mtu), buffer + 20, size);
+            if (handleTransfer(buffer, static_cast<long>(length))) ttl = ttl_max;
         } else if (strncmp(buffer, "FINISH", 6) == 0) {
-            if (static_cast<size_t>(length) < 10) continue;
-            if (Utils::getNumberFromBytes(buffer + 6, 4) != session_id) continue;
-            ttl = ttl_max;
-            // If receiver didn't receive a finish message
-            if (!finish) {
-                std::cout << "Server finished transferring" << std::endl;
-                finish = true;
-            }
+            handleFinish(buffer, static_cast<long>(length), finish);
         }
     }
     // ttl exhausted before FINISH: the transfer did not complete.

@@ -1,6 +1,7 @@
 #include "Config.hpp"
 
 std::string fileName;
+bool        fileNameFromCli = false;
 
 int mtu      = 0;
 int ttl      = 0;

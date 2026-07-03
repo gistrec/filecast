@@ -6,7 +6,8 @@
 #include <string>
 
 
-extern std::string fileName; // File Name to transfer or receive
+extern std::string fileName;     // File Name to transfer or receive
+extern bool        fileNameFromCli; // true if the user gave an explicit output name
 
 extern int mtu;     // Max packet size to send and receive
 

@@ -34,6 +34,9 @@ LAN at once, with automatic retransmission of dropped packets.
 - Broadcast to every host on a LAN with a single transmission
 - Unicast mode for point-to-point transfer
 - Automatic retransmission of lost packets
+- End-to-end SHA-256 integrity check — a corrupted file is rejected, not saved
+- File name travels with the transfer, so `receive` needs no arguments
+- Chunk size negotiated in-band, so mismatched `--mtu` no longer stalls
 - Configurable MTU and timeout
 - Windows, Linux, and macOS binaries built on every release
 
@@ -52,8 +55,11 @@ directly. No installation required.
 **Receiver** (one or more hosts on the same LAN):
 
 ```sh
-./filecast receive photo.jpg
+./filecast receive
 ```
+
+The file is saved under the name the sender announced (pass a path to override
+it, e.g. `./filecast receive my-photo.jpg`).
 
 Send to a specific host instead of broadcasting to the whole LAN:
 
@@ -72,14 +78,14 @@ If your platform isn't covered, see [Building from Source](#building-from-source
 
 ```sh
 filecast send <file> [options]       # broadcast a file to the LAN
-filecast receive [file] [options]    # receive a file (default: file.out)
+filecast receive [file] [options]    # receive a file (default: name from sender)
 ```
 
 ## Parameters
 
 | Parameter | Default | Range | Description |
 | --------- | ------- | ----- | ----------- |
-| `<file>` (positional) | — (send) / `file.out` (receive) | — | File to send, or where to save it. `-f, --file` is an alias |
+| `<file>` (positional) | — (send) / name from sender (receive) | — | File to send, or where to save it. `-f, --file` is an alias |
 | `--to`        | broadcast  | IPv4 | Send to one host instead of LAN broadcast |
 | `-p, --port`  | `33333`    | 1..65535 | Destination port for outgoing packets |
 | `--bind-port` | `33333`    | 1..65535 | Local port to bind on |
@@ -126,30 +132,40 @@ development):
 
 ## How It Works
 
-1. Sender broadcasts a `NEW_PACKET` packet with the total file size.
-2. Each receiver allocates a buffer of that size and clears its part registry.
-3. Sender splits the file into MTU-sized chunks and broadcasts each one as a
-   `TRANSFER` packet.
+1. Sender broadcasts a `NEW_PACKET` announcing a random session id, the total
+   file size, the chunk size, the file's SHA-256, and its name.
+2. Each receiver latches that session, allocates a buffer, and clears its part
+   registry. Packets from any other session are ignored.
+3. Sender splits the file into chunk-sized pieces and broadcasts each one as a
+   `TRANSFER` packet, tagged with the session id.
 4. Sender broadcasts a `FINISH` packet when all chunks have been sent.
 5. Each receiver scans for missing chunks and requests them with `RESEND`
    packets.
 6. Sender retransmits each requested chunk.
 7. Steps 5–6 repeat until every chunk is received or the TTL expires.
+8. The receiver recomputes the SHA-256 of the reassembled file and only writes
+   it out if the digest matches; otherwise it reports corruption and fails.
 
 ## Packet Structure
 
-![Packet structure](https://www.gistrec.ru/wp-content/uploads/2019/01/Packets.png)
+All multi-byte fields are big-endian. Every packet carries the 32-bit session id
+so a receiver ignores traffic from a different (or restarted) sender.
+
+| Packet | Layout |
+| ------ | ------ |
+| `NEW_PACKET` | `"NEW_PACKET"` · version(2) · session(4) · file_size(4) · chunk_size(4) · sha256(32) · name_len(2) · name |
+| `TRANSFER` | `"TRANSFER"` · session(4) · part(4) · length(4) · data |
+| `FINISH` | `"FINISH"` · session(4) |
+| `RESEND` | `"RESEND"` · session(4) · part(4) |
 
 ## Limitations
 
 - The whole file is held in RAM on both sides. The receiver enforces a 4 GiB
-  cap on the announced file size; the sender is bounded only by available
-  memory.
-- No data integrity check beyond UDP's optional 16-bit checksum. If the
-  payload is corrupted in a way the checksum doesn't catch, the receiver will
-  silently produce a corrupted file.
+  cap on the announced file size; the sender rejects files that do not fit the
+  4-byte wire size field.
 - No authentication. Any host on the same LAN can send a `NEW_PACKET` and any
-  receiver bound to the chosen port will accept it.
+  receiver bound to the chosen port will accept it. The SHA-256 check catches
+  accidental corruption, not a deliberately crafted stream.
 - No encryption. The payload travels as plaintext UDP.
 
 ## Building from Source
