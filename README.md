@@ -37,7 +37,8 @@ LAN at once, with automatic retransmission of dropped packets.
 - End-to-end SHA-256 integrity check — a corrupted file is rejected, not saved
 - File name travels with the transfer, so `receive` needs no arguments
 - Chunk size negotiated in-band, so mismatched `--mtu` no longer stalls
-- Configurable MTU and timeout
+- Live progress bar with speed and ETA, and a rate limit in Mbit/s
+- Never clobbers an existing file unless you pass `--overwrite`
 - Windows, Linux, and macOS binaries built on every release
 
 ## Quick Start
@@ -91,7 +92,10 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 | `--bind-port` | `33333`    | 1..65535 | Local port to bind on |
 | `--mtu`       | `1500`     | 64..65507 | Max packet size in bytes |
 | `--ttl`       | `15`       | > 0 | Seconds of silence before giving up |
-| `--delay-ms`  | `20`       | ≥ 0 | Pause between successive packets (use `0` for loopback / tests) |
+| `--rate`      | `100`      | > 0 | Target send rate in Mbit/s |
+| `--overwrite` | off        | — | Overwrite an existing output file |
+| `-v, --verbose` | off      | — | Log every packet instead of a progress bar |
+| `--delay-ms`  | —          | ≥ 0 | Advanced: fixed inter-packet pause in ms; overrides `--rate` (`0` blasts at full speed, used by tests) |
 | `-h, --help`  | —          | — | Print help |
 | `--version`   | —          | — | Print version |
 

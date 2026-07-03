@@ -2,11 +2,13 @@
 
 std::string fileName;
 bool        fileNameFromCli = false;
+bool        verbose         = false;
+bool        overwrite       = false;
 
-int mtu      = 0;
-int ttl      = 0;
-int ttl_max  = 0;
-int delay_ms = 0;
+int     mtu     = 0;
+int     ttl     = 0;
+int     ttl_max = 0;
+int64_t pace_us = 0;
 
 SOCKET _socket;
 

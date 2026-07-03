@@ -1,6 +1,7 @@
 #include "Utils.hpp"
 #include "Config.hpp"
 #include "Sha256.hpp"
+#include "Progress.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -50,6 +51,11 @@ uint8_t expected_hash[32] = {0};
 
 // File name announced by the sender, used when the user did not name the output.
 std::string announced_name;
+
+// Progress bar for the current transfer and the running total of stored payload
+// bytes that drives it.
+Progress::Reporter reporter;
+size_t received_bytes = 0;
 
 /**
  * List of received parts
@@ -123,13 +129,22 @@ bool handleTransfer(const char* buf, int64_t length) {
 
     parts.insert(part);
     memcpy(file + part * chunk_size, buf + TRANSFER_HEADER, size);
-    std::cout << "Receive " << part << " part with size " << size << std::endl;
+    received_bytes += size;
+    reporter.update(received_bytes);
+    if (verbose) std::cout << "Receive " << part << " part with size " << size << std::endl;
     return true;
+}
+
+bool fileExists(const std::string& path) {
+    std::ifstream f(path);
+    return f.good();
 }
 
 // Verify the reassembled file against the announced digest and write it out.
 // Returns a process exit code.
 int verifyAndWrite() {
+    reporter.finish();
+
     uint8_t got[32];
     Sha256::hash(file, file_length, got);
     if (memcmp(got, expected_hash, 32) != 0) {
@@ -138,24 +153,59 @@ int verifyAndWrite() {
         file = nullptr;
         return 2;
     }
-    std::cout << "Ok: sha256 verified " << Sha256::hex(got) << std::endl;
 
-    std::ofstream output(fileName, std::ofstream::binary);
+    // Refuse to clobber an existing file unless the user opted in.
+    if (!overwrite && fileExists(fileName)) {
+        std::cerr << "Error: output file " << fileName
+                  << " already exists (use --overwrite to replace it)" << std::endl;
+        delete[] file;
+        file = nullptr;
+        return 2;
+    }
+
+    // Write to a temporary and rename on success, so an interrupted write never
+    // leaves a truncated file under the target name.
+    const std::string tmp = fileName + ".part";
+    std::ofstream output(tmp, std::ofstream::binary | std::ofstream::trunc);
     if (!output.is_open()) {
-        std::cerr << "Error: Can't open output file " << fileName << std::endl;
+        std::cerr << "Error: Can't open output file " << tmp << std::endl;
         delete[] file;
         file = nullptr;
         return 2;
     }
     output.write(file, static_cast<std::streamsize>(file_length));
+    output.close();
     if (!output) {
-        std::cerr << "Error: Failed to write output file " << fileName << std::endl;
+        std::cerr << "Error: Failed to write output file " << tmp << std::endl;
+        std::remove(tmp.c_str());
         delete[] file;
         file = nullptr;
         return 2;
     }
-    output.close();
-    std::cout << "File successfully received as " << fileName << std::endl;
+    // On POSIX rename() atomically replaces the target, so no pre-remove is
+    // needed. On Windows rename() refuses to overwrite, so drop the target
+    // first (only meaningful with --overwrite, since otherwise it does not exist).
+    #if defined(_WIN32) || defined(_WIN64)
+    std::remove(fileName.c_str());
+    #endif
+    if (std::rename(tmp.c_str(), fileName.c_str()) != 0) {
+        // Keep the verified .part so the transfer is not lost — the RAM copy is
+        // freed below, so this file is the only remaining copy of the data.
+        std::cerr << "Error: Failed to finalize " << fileName
+                  << "; verified data kept at " << tmp << std::endl;
+        delete[] file;
+        file = nullptr;
+        return 2;
+    }
+
+    double secs = reporter.elapsed();
+    double rate = secs > 0 ? file_length / secs : 0;
+    std::cout << "Received " << fileName << " (" << Progress::humanBytes(file_length) << ")";
+    if (secs > 0) {
+        std::cout << " in " << Progress::humanDuration(secs)
+                  << " at " << Progress::humanRate(rate);
+    }
+    std::cout << "; sha256 verified" << std::endl;
 
     delete[] file;
     file = nullptr;
@@ -186,8 +236,8 @@ int checkParts() {
             Utils::writeBytesFromNumber(buffer + 10, index,      4);
             sendto(_socket, buffer, 14, 0, reinterpret_cast<sockaddr*>(&broadcast_address),
                    sizeof(broadcast_address));
-            std::cout << "Request part of file with index " << index << std::endl;
-            if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            if (verbose) std::cout << "Request part of file with index " << index << std::endl;
+            if (pace_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
         }
 
         // Drain every packet already queued (until the socket times out via
@@ -221,6 +271,7 @@ int checkParts() {
     delete[] buffer;
 
     if (!emptyParts.empty()) {
+        reporter.finish();  // clear the bar before the error line
         std::cerr << "Error: Transfer timed out, file is incomplete" << std::endl;
         delete[] file;
         file = nullptr;
@@ -250,6 +301,33 @@ bool announceValid(size_t announced, size_t chunk, int& exit_code) {
     if (chunk < 64 || chunk > 65507) {
         std::cerr << "Error: Sender announced invalid chunk size " << chunk << std::endl;
         exit_code = 2;
+        return false;
+    }
+    return true;
+}
+
+// Grow the receive buffer to hold a full chunk and (re)allocate the file buffer
+// for a new transfer. Sets exit_code and returns false on allocation failure.
+bool allocateBuffers(char*& buf, size_t& bufcap, int& exit_code) {
+    size_t need = chunk_size + TRANSFER_HEADER;
+    if (need > bufcap) {
+        delete[] buf;
+        bufcap = need;
+        buf = new (std::nothrow) char[bufcap];
+        if (!buf) {
+            std::cerr << "Error: Can't allocate receive buffer" << std::endl;
+            exit_code = 1;
+            return false;
+        }
+    }
+
+    delete[] file;
+    parts.clear();
+    received_bytes = 0;
+    file = new (std::nothrow) char[file_length];
+    if (!file) {
+        std::cerr << "Error: Can't allocate " << file_length << " bytes" << std::endl;
+        exit_code = 1;
         return false;
     }
     return true;
@@ -297,31 +375,14 @@ bool handleNewPacket(char*& buf, size_t& bufcap, int64_t length, int& exit_code)
     announced_name = sanitizeName(std::string(buf + NEW_PACKET_FIXED, name_len));
     if (!fileNameFromCli) fileName = announced_name;
 
-    // Grow the receive buffer if a TRANSFER for this chunk size would not fit.
-    size_t need = chunk_size + TRANSFER_HEADER;
-    if (need > bufcap) {
-        delete[] buf;
-        bufcap = need;
-        buf = new (std::nothrow) char[bufcap];
-        if (!buf) {
-            std::cerr << "Error: Can't allocate receive buffer" << std::endl;
-            exit_code = 1;
-            return false;
-        }
-    }
+    if (!allocateBuffers(buf, bufcap, exit_code)) return false;
 
-    delete[] file;
-    parts.clear();
-    file = new (std::nothrow) char[file_length];
-    if (!file) {
-        std::cerr << "Error: Can't allocate " << file_length << " bytes" << std::endl;
-        exit_code = 1;
-        return false;
+    if (verbose) {
+        std::cout << "Receive information about new file: " << fileName
+                  << " (" << file_length << " bytes)" << std::endl;
+        std::cout << "Number of parts: " << totalParts() << std::endl;
     }
-
-    std::cout << "Receive information about new file: " << fileName
-              << " (" << file_length << " bytes)" << std::endl;
-    std::cout << "Number of parts: " << totalParts() << std::endl;
+    reporter.start("Receiving " + fileName, file_length, verbose);
     return true;
 }
 
@@ -332,7 +393,7 @@ void handleFinish(const char* buf, int64_t length, bool& finish) {
     if (Utils::getNumberFromBytes(buf + 6, 4) != session_id) return;
     ttl = ttl_max;
     if (!finish) {
-        std::cout << "Server finished transferring" << std::endl;
+        if (verbose) std::cout << "Server finished transferring" << std::endl;
         finish = true;
     }
 }
@@ -346,6 +407,10 @@ int run() {
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
         return 1;
+    }
+
+    if (!verbose) {
+        std::cerr << "Waiting for a sender... (Ctrl+C to cancel)" << std::endl;
     }
 
     while (ttl > 0) {
@@ -392,6 +457,7 @@ int run() {
         }
     }
     // ttl exhausted before FINISH: the transfer did not complete.
+    reporter.finish();  // clear the bar if one was drawn
     delete[] buffer;
     delete[] file;
     file = nullptr;

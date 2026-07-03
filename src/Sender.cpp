@@ -1,6 +1,7 @@
 #include "Utils.hpp"
 #include "Config.hpp"
 #include "Sha256.hpp"
+#include "Progress.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <string>
+#include <algorithm>
 #include <map>
 #include <random>
 
@@ -71,7 +73,14 @@ void sendPart(size_t part_index) {
         std::cerr << "Warning: Failed to send part " << part_index << std::endl;
         return;
     }
-    std::cout << "Part " << part_index << " with size " << packet_length << " was sent" << std::endl;
+    if (verbose) {
+        std::cout << "Part " << part_index << " with size " << packet_length << " was sent" << std::endl;
+    }
+}
+
+// Pause between packets to pace the transfer (0 = blast at full speed).
+void pace() {
+    if (pace_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
 }
 
 void sendFinish() {
@@ -137,7 +146,7 @@ void sendNewPacket() {
     // Digest of the whole file; the receiver verifies against it after reassembly.
     uint8_t file_hash[32];
     Sha256::hash(file, file_length, file_hash);
-    std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
+    if (verbose) std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
 
     // Name the receiver saves under unless it was given an explicit output path.
     // Clamp so the whole NEW_PACKET fits the send buffer (2 * mtu) and the length
@@ -163,16 +172,18 @@ void sendNewPacket() {
                    sizeof(broadcast_address)) < 0) {
             std::cerr << "Warning: Failed to send NEW_PACKET" << std::endl;
         }
-        if (i + 1 < 3 && delay_ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-        }
+        if (i + 1 < 3) pace();
     }
-    std::cout << "Ok: Sent information about new file with size " << file_length << std::endl;
+    if (verbose) {
+        std::cout << "Ok: Sent information about new file with size " << file_length << std::endl;
+    }
 }
 
 // Serve RESEND requests until ttl expires, re-announcing FINISH periodically.
-void serveResends(size_t total_parts) {
+// Returns how many parts were re-sent on request.
+size_t serveResends(size_t total_parts) {
     int64_t lastFinishSendTime = 0;
+    size_t  resent = 0;
 
     SOCKADDR_IN sender_address;
     memset(&sender_address, 0, sizeof(sender_address));
@@ -209,8 +220,11 @@ void serveResends(size_t total_parts) {
 
         if (duration - sent_part[part] >= 1) {
             sent_part[part] = duration;
-            std::cout << "Client requested part of file with index " << part << std::endl;
+            if (verbose) {
+                std::cout << "Client requested part of file with index " << part << std::endl;
+            }
             sendPart(part);
+            ++resent;
         }
         // Re-announce completion at most once a second.
         if (duration - lastFinishSendTime >= 1) {
@@ -218,6 +232,7 @@ void serveResends(size_t total_parts) {
             sendFinish();
         }
     }
+    return resent;
 }
 
 // Returns a process exit code: 0 on success, non-zero on failure.
@@ -231,22 +246,36 @@ int run() {
         CLEANUP_NETWORK();
         return 1;
     }
-    std::cout << "Ok: File successfully copied to RAM" << std::endl;
+    if (verbose) std::cout << "Ok: File successfully copied to RAM" << std::endl;
 
     sendNewPacket();
+
+    const std::string name = baseName(fileName);
+    Progress::Reporter reporter;
+    reporter.start("Sending " + name, file_length, verbose);
 
     size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
         sent_part.insert({ part_index, 0 });
         sendPart(part_index);
-        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        reporter.update(std::min((part_index + 1) * static_cast<size_t>(mtu), file_length));
+        pace();
     }
+    reporter.finish();
+
+    double secs = reporter.elapsed();
+    double rate = secs > 0 ? file_length / secs : 0;
+    std::cout << "Sent " << name << " (" << Progress::humanBytes(file_length)
+              << ") in " << Progress::humanDuration(secs)
+              << " at " << Progress::humanRate(rate) << std::endl;
 
     sendFinish();
-    std::cout << "Ok: File transfer complete" << std::endl;
 
-    serveResends(total_parts);
-    std::cout << "Ok: Transfer session ended" << std::endl;
+    size_t resent = serveResends(total_parts);
+    if (resent > 0) {
+        std::cout << "Re-sent " << resent << " part(s) on request" << std::endl;
+    }
+    if (verbose) std::cout << "Ok: Transfer session ended" << std::endl;
 
     delete[] buffer;
     delete[] file;
