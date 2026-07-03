@@ -155,7 +155,12 @@ void run() {
     addr_len sender_address_length = sizeof(sender_address);
 
     while (ttl) {
-        auto result = recvfrom(_socket, buffer, 100, 0,
+        // Read into the full buffer (2 * mtu). The socket is bound to the same
+        // port we broadcast to, so the OS also delivers copies of our own
+        // TRANSFER packets here; on Windows a 100-byte buffer made those
+        // oversized datagrams fail with WSAEMSGSIZE, which was misread as a
+        // timeout and prematurely drained ttl, killing the resend phase.
+        auto result = recvfrom(_socket, buffer, 2 * mtu, 0,
                                reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
         // No incoming requests for a while - resend FINISH and decrement ttl.
