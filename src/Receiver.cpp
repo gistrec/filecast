@@ -73,27 +73,35 @@ void checkParts() {
             continue;
         }
 
-        ttl = ttl_max;
-
+        // Only a valid, wanted TRANSFER counts as progress and refreshes ttl.
+        // Everything else — most importantly our own broadcast RESENDs looped
+        // back to us by the OS in the default (--broadcast yes, port==bind-port)
+        // configuration — must count down toward the timeout. Otherwise, once
+        // the sender goes away, the receiver never times out: it endlessly
+        // re-requests the same parts and floods the LAN with RESENDs forever.
+        bool progressed = false;
         if (strncmp(buffer, "TRANSFER", 8) == 0) {
             size_t part        = Utils::getNumberFromBytes(buffer +  8, 4);
             size_t size        = Utils::getNumberFromBytes(buffer + 12, 4);
             size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
 
-            if (part >= total_parts) continue;
             // For non-final parts size must equal MTU; for the final part it must
             // equal the remaining bytes. Anything else is malformed and would
             // either silently zero-pad data or write past the file buffer.
             size_t expected = (part + 1 < total_parts)
                 ? static_cast<size_t>(mtu)
                 : (file_length - part * static_cast<size_t>(mtu));
-            if (size != expected) continue;
-            if (static_cast<size_t>(length) < size + 16) continue;
-
-            parts.insert(part);
-            memcpy(file + part * static_cast<size_t>(mtu), buffer + 16, size);
-            std::cout << "Receive " << part << " part with size " << size << std::endl;
+            if (part < total_parts && size == expected &&
+                static_cast<size_t>(length) >= size + 16) {
+                parts.insert(part);
+                memcpy(file + part * static_cast<size_t>(mtu), buffer + 16, size);
+                std::cout << "Receive " << part << " part with size " << size << std::endl;
+                progressed = true;
+            }
         }
+
+        if (progressed) ttl = ttl_max;
+        else            ttl--;
 
         emptyParts = getEmptyParts();
     }
@@ -168,9 +176,12 @@ void run() {
             continue;
         }
 
-        ttl = ttl_max; // Update ttl
-
         if (strncmp(buffer, "NEW_PACKET", 10) == 0 && static_cast<size_t>(length) >= 14) {
+            // Only a recognised protocol packet from the sender refreshes ttl.
+            // Unrecognised traffic (stray broadcasts, other receivers' RESENDs,
+            // garbage) deliberately does not, so the timeout stays reachable and
+            // a hostile or noisy host cannot keep the receiver alive forever.
+            ttl = ttl_max;
             size_t announced = Utils::getNumberFromBytes(buffer + 10, 4);
             if (announced == 0) {
                 std::cerr << "Error: Sender announced empty file" << std::endl;
@@ -218,11 +229,13 @@ void run() {
             if (size != expected) continue;
             if (static_cast<size_t>(length) < size + 16) continue;
 
+            ttl = ttl_max;
             parts.insert(part);
             std::cout << "Receive " << part << " part with size " << size << std::endl;
 
             memcpy(file + part * static_cast<size_t>(mtu), buffer + 16, size);
         } else if (strncmp(buffer, "FINISH", 6) == 0) {
+            ttl = ttl_max;
             // If receiver didn't receive a finish message
             if (!finish) {
                 std::cout << "Server finished transferring" << std::endl;
