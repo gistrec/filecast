@@ -7,14 +7,22 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cstdint>
 #include <map>
+#include <random>
 
 using namespace std::chrono_literals;
 
 
 namespace Sender {
 
-constexpr int HEADER_SIZE = 16;
+// TRANSFER header: "TRANSFER"(8) + session id(4) + part number(4) + length(4).
+constexpr int HEADER_SIZE = 20;
+
+// Random per-transfer id, generated in run() and stamped into every packet so a
+// receiver can reject packets from a different sender (a second concurrent
+// sender, or a restart) instead of silently mixing two files into one buffer.
+uint32_t session_id = 0;
 
 // The file size is announced in a 4-byte field in NEW_PACKET, so anything that
 // does not fit into 32 bits would be silently truncated on the wire (a 4 GiB
@@ -34,9 +42,10 @@ void sendPart(size_t part_index) {
     if (packet_length > static_cast<size_t>(mtu)) packet_length = static_cast<size_t>(mtu);
 
     snprintf(buffer, 9, "TRANSFER");
-    Utils::writeBytesFromNumber(buffer +  8, part_index,    4); // Write section "number"
-    Utils::writeBytesFromNumber(buffer + 12, packet_length, 4); // Write section "length"
-    memcpy(buffer + 16, file + offset, packet_length);          // Write section "data"
+    Utils::writeBytesFromNumber(buffer +  8, session_id,    4); // Write section "session"
+    Utils::writeBytesFromNumber(buffer + 12, part_index,    4); // Write section "number"
+    Utils::writeBytesFromNumber(buffer + 16, packet_length, 4); // Write section "length"
+    memcpy(buffer + 20, file + offset, packet_length);          // Write section "data"
 
     auto sent = sendto(_socket, buffer, static_cast<int>(packet_length + HEADER_SIZE), 0,
                        reinterpret_cast<sockaddr*>(&broadcast_address), sizeof(broadcast_address));
@@ -115,13 +124,17 @@ int run() {
 
     std::cout << "Ok: File successfully copied to RAM" << std::endl;
 
+    std::random_device rd;
+    session_id = static_cast<uint32_t>(rd());
+
     snprintf(buffer, 11, "NEW_PACKET");
-    Utils::writeBytesFromNumber(buffer + 10, file_length, 4);
+    Utils::writeBytesFromNumber(buffer + 10, session_id, 4);
+    Utils::writeBytesFromNumber(buffer + 14, file_length, 4);
     // NEW_PACKET is sent only once (no RESEND mechanism for it), so a single
     // dropped packet would strand every receiver. Retransmit a few times to
     // make the start of the transfer robust to typical LAN loss.
     for (int i = 0; i < 3; ++i) {
-        if (sendto(_socket, buffer, 14, 0,
+        if (sendto(_socket, buffer, 18, 0,
                    reinterpret_cast<sockaddr*>(&broadcast_address),
                    sizeof(broadcast_address)) < 0) {
             std::cerr << "Warning: Failed to send NEW_PACKET" << std::endl;
@@ -142,7 +155,8 @@ int run() {
     }
 
     snprintf(buffer, 7, "FINISH");
-    if (sendto(_socket, buffer, 6, 0,
+    Utils::writeBytesFromNumber(buffer + 6, session_id, 4);
+    if (sendto(_socket, buffer, 10, 0,
                reinterpret_cast<sockaddr*>(&broadcast_address),
                sizeof(broadcast_address)) < 0) {
         std::cerr << "Warning: Failed to send FINISH" << std::endl;
@@ -168,7 +182,8 @@ int run() {
         if (result <= 0) {
             ttl--;
             snprintf(buffer, 7, "FINISH");
-            if (sendto(_socket, buffer, 6, 0,
+            Utils::writeBytesFromNumber(buffer + 6, session_id, 4);
+            if (sendto(_socket, buffer, 10, 0,
                        reinterpret_cast<sockaddr*>(&broadcast_address),
                        sizeof(broadcast_address)) < 0) {
                 std::cerr << "Warning: Failed to send FINISH" << std::endl;
@@ -177,7 +192,11 @@ int run() {
         }
 
         if (strncmp(buffer, "RESEND", 6) == 0) {
-            size_t part = Utils::getNumberFromBytes(buffer + 6, 4);
+            // Ignore RESENDs shorter than the header or belonging to a different
+            // session (another sender's receivers requesting their own transfer).
+            if (result < 14) continue;
+            if (Utils::getNumberFromBytes(buffer + 6, 4) != session_id) continue;
+            size_t part = Utils::getNumberFromBytes(buffer + 10, 4);
 
             if (part >= total_parts) continue;
 
@@ -197,7 +216,8 @@ int run() {
             if (duration - lastFinishSendTime >= 1) {
                 lastFinishSendTime = duration;
                 snprintf(buffer, 7, "FINISH");
-                if (sendto(_socket, buffer, 6, 0,
+                Utils::writeBytesFromNumber(buffer + 6, session_id, 4);
+                if (sendto(_socket, buffer, 10, 0,
                            reinterpret_cast<sockaddr*>(&broadcast_address),
                            sizeof(broadcast_address)) < 0) {
                     std::cerr << "Warning: Failed to send FINISH" << std::endl;

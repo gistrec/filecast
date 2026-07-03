@@ -20,6 +20,13 @@ namespace Receiver {
 // only if you know the receiver has enough memory.
 constexpr size_t MAX_FILE_LENGTH = 4ULL * 1024 * 1024 * 1024; // 4 GiB
 
+// Session the receiver is currently bound to. The sender stamps a random id into
+// every packet; we latch it from the first NEW_PACKET and then reject packets
+// from any other session, so a second sender (or a restarted one) cannot mix a
+// different file into our buffer and have us report success on garbage.
+size_t session_id   = 0;
+bool   have_session = false;
+
 /**
  * List of received parts
  */
@@ -56,8 +63,9 @@ int checkParts() {
     while (ttl && !emptyParts.empty()) {
         for (auto index : emptyParts) {
             snprintf(buffer, 7, "RESEND");
-            Utils::writeBytesFromNumber(buffer + 6, index, 4);
-            sendto(_socket, buffer, 10, 0, reinterpret_cast<sockaddr*>(&broadcast_address),
+            Utils::writeBytesFromNumber(buffer +  6, session_id, 4);
+            Utils::writeBytesFromNumber(buffer + 10, index,      4);
+            sendto(_socket, buffer, 14, 0, reinterpret_cast<sockaddr*>(&broadcast_address),
                    sizeof(broadcast_address));
             std::cout << "Request part of file with index " << index << std::endl;
             if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
@@ -79,9 +87,11 @@ int checkParts() {
                                    &sender_address_length);
             if (length <= 0) break;                              // queue drained this round
             if (strncmp(buffer, "TRANSFER", 8) != 0) continue;   // e.g. our own RESEND
+            if (static_cast<size_t>(length) < 20) continue;
+            if (Utils::getNumberFromBytes(buffer + 8, 4) != session_id) continue;
 
-            size_t part        = Utils::getNumberFromBytes(buffer +  8, 4);
-            size_t size        = Utils::getNumberFromBytes(buffer + 12, 4);
+            size_t part        = Utils::getNumberFromBytes(buffer + 12, 4);
+            size_t size        = Utils::getNumberFromBytes(buffer + 16, 4);
             size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
 
             // For non-final parts size must equal MTU; for the final part it must
@@ -91,9 +101,9 @@ int checkParts() {
                 ? static_cast<size_t>(mtu)
                 : (file_length - part * static_cast<size_t>(mtu));
             if (part < total_parts && parts.find(part) == parts.end() &&
-                size == expected && static_cast<size_t>(length) >= size + 16) {
+                size == expected && static_cast<size_t>(length) >= size + 20) {
                 parts.insert(part);
-                memcpy(file + part * static_cast<size_t>(mtu), buffer + 16, size);
+                memcpy(file + part * static_cast<size_t>(mtu), buffer + 20, size);
                 std::cout << "Receive " << part << " part with size " << size << std::endl;
                 progressed = true;
             }
@@ -179,13 +189,20 @@ int run() {
             continue;
         }
 
-        if (strncmp(buffer, "NEW_PACKET", 10) == 0 && static_cast<size_t>(length) >= 14) {
-            // Only a recognised protocol packet from the sender refreshes ttl.
-            // Unrecognised traffic (stray broadcasts, other receivers' RESENDs,
-            // garbage) deliberately does not, so the timeout stays reachable and
-            // a hostile or noisy host cannot keep the receiver alive forever.
+        if (strncmp(buffer, "NEW_PACKET", 10) == 0 && static_cast<size_t>(length) >= 18) {
+            size_t incoming_sid = Utils::getNumberFromBytes(buffer + 10, 4);
+            // A NEW_PACKET from a different session (a second sender, or our own
+            // sender restarted) must not clobber the transfer already in progress.
+            if (have_session && incoming_sid != session_id) {
+                std::cerr << "Warning: ignoring NEW_PACKET from another sender session" << std::endl;
+                continue;
+            }
+            // Only a recognised packet from our sender refreshes ttl. Unrecognised
+            // traffic (stray broadcasts, other receivers' RESENDs, garbage)
+            // deliberately does not, so the timeout stays reachable and a hostile
+            // or noisy host cannot keep the receiver alive forever.
             ttl = ttl_max;
-            size_t announced = Utils::getNumberFromBytes(buffer + 10, 4);
+            size_t announced = Utils::getNumberFromBytes(buffer + 14, 4);
             if (announced == 0) {
                 std::cerr << "Error: Sender announced empty file" << std::endl;
                 delete[] buffer;
@@ -203,7 +220,9 @@ int run() {
             // duplicate and keep accumulated parts.
             if (file != nullptr && announced == file_length) continue;
 
-            file_length = announced;
+            session_id   = incoming_sid;
+            have_session = true;
+            file_length  = announced;
 
             delete[] file;
             parts.clear();
@@ -218,8 +237,10 @@ int run() {
             std::cout << "Receive information about new file size: " << file_length << std::endl;
             std::cout << "Number of parts: " << (file_length + mtu - 1) / mtu << std::endl;
         } else if (strncmp(buffer, "TRANSFER", 8) == 0 && file != nullptr) {
-            size_t part        = Utils::getNumberFromBytes(buffer +  8, 4); // Read section "index"
-            size_t size        = Utils::getNumberFromBytes(buffer + 12, 4); // Read section "size"
+            if (static_cast<size_t>(length) < 20) continue;
+            if (Utils::getNumberFromBytes(buffer + 8, 4) != session_id) continue;
+            size_t part        = Utils::getNumberFromBytes(buffer + 12, 4); // Read section "index"
+            size_t size        = Utils::getNumberFromBytes(buffer + 16, 4); // Read section "size"
             size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
 
             if (part >= total_parts) continue;
@@ -230,14 +251,16 @@ int run() {
                 ? static_cast<size_t>(mtu)
                 : (file_length - part * static_cast<size_t>(mtu));
             if (size != expected) continue;
-            if (static_cast<size_t>(length) < size + 16) continue;
+            if (static_cast<size_t>(length) < size + 20) continue;
 
             ttl = ttl_max;
             parts.insert(part);
             std::cout << "Receive " << part << " part with size " << size << std::endl;
 
-            memcpy(file + part * static_cast<size_t>(mtu), buffer + 16, size);
+            memcpy(file + part * static_cast<size_t>(mtu), buffer + 20, size);
         } else if (strncmp(buffer, "FINISH", 6) == 0) {
+            if (static_cast<size_t>(length) < 10) continue;
+            if (Utils::getNumberFromBytes(buffer + 6, 4) != session_id) continue;
             ttl = ttl_max;
             // If receiver didn't receive a finish message
             if (!finish) {
