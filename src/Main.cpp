@@ -9,8 +9,8 @@
 #define FILECAST_VERSION "1.0.0"
 #endif
 
-namespace Receiver { void run(); }
-namespace Sender   { void run(); }
+namespace Receiver { int run(); }
+namespace Sender   { int run(); }
 
 
 static void cleanupAndExit(int code) {
@@ -176,14 +176,11 @@ int main(int argc, char* argv[]) {
                reinterpret_cast<const char*>(&tv), sizeof(tv));
     #endif
 
-    // Run receiver or sender
-    if (type == "receiver") {
-        Receiver::run();
-    } else {
-        Sender::run();
-    }
+    // Run receiver or sender; propagate its status as the process exit code so
+    // automation (deploy scripts, CI, Ansible) can tell success from failure.
+    int rc = (type == "receiver") ? Receiver::run() : Sender::run();
 
     CLOSE_SOCKET(_socket);
     CLEANUP_NETWORK();
-    return 0;
+    return rc;
 }

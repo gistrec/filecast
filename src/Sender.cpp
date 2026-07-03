@@ -47,7 +47,8 @@ void sendPart(size_t part_index) {
     std::cout << "Part " << part_index << " with size " << packet_length << " was sent" << std::endl;
 }
 
-void run() {
+// Returns a process exit code: 0 on success, non-zero on failure.
+int run() {
     buffer = new char[2 * mtu];
 
     std::ifstream input(fileName, std::ios::binary);
@@ -57,7 +58,7 @@ void run() {
         buffer = nullptr;
         CLOSE_SOCKET(_socket);
         CLEANUP_NETWORK();
-        exit(-1);
+        return 1;
     }
 
     input.seekg(0, std::ios::end);
@@ -68,7 +69,7 @@ void run() {
         buffer = nullptr;
         CLOSE_SOCKET(_socket);
         CLEANUP_NETWORK();
-        exit(-1);
+        return 1;
     }
     file_length = static_cast<size_t>(end_pos);
     input.seekg(0, std::ios::beg);
@@ -79,7 +80,7 @@ void run() {
         buffer = nullptr;
         CLOSE_SOCKET(_socket);
         CLEANUP_NETWORK();
-        exit(-1);
+        return 1;
     }
 
     if (file_length > MAX_WIRE_FILE_LENGTH) {
@@ -90,7 +91,7 @@ void run() {
         buffer = nullptr;
         CLOSE_SOCKET(_socket);
         CLEANUP_NETWORK();
-        exit(-1);
+        return 1;
     }
 
     file = new (std::nothrow) char[file_length];
@@ -100,7 +101,7 @@ void run() {
         buffer = nullptr;
         CLOSE_SOCKET(_socket);
         CLEANUP_NETWORK();
-        exit(-1);
+        return 1;
     }
     input.read(file, static_cast<std::streamsize>(file_length));
     if (static_cast<size_t>(input.gcount()) != file_length) {
@@ -109,7 +110,7 @@ void run() {
         delete[] buffer; buffer = nullptr;
         CLOSE_SOCKET(_socket);
         CLEANUP_NETWORK();
-        exit(-1);
+        return 1;
     }
 
     std::cout << "Ok: File successfully copied to RAM" << std::endl;
@@ -210,6 +211,7 @@ void run() {
     delete[] file;
     buffer = nullptr;
     file   = nullptr;
+    return 0;
 }
 
 
