@@ -41,13 +41,14 @@ std::vector<size_t> getEmptyParts() {
  * Runs when "FINISH" packet is received
  * Gets empty parts and requests them from the server
  */
-void checkParts() {
+// Returns a process exit code: 0 on success, non-zero on failure.
+int checkParts() {
     char* buffer = new (std::nothrow) char[2 * mtu];
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
         delete[] file;
         file = nullptr;
-        return;
+        return 1;
     }
 
     std::vector<size_t> emptyParts = getEmptyParts();
@@ -112,7 +113,7 @@ void checkParts() {
         std::cerr << "Error: Transfer timed out, file is incomplete" << std::endl;
         delete[] file;
         file = nullptr;
-        return;
+        return 2;
     }
 
     std::ofstream output(fileName, std::ofstream::binary);
@@ -120,30 +121,32 @@ void checkParts() {
         std::cerr << "Error: Can't open output file " << fileName << std::endl;
         delete[] file;
         file = nullptr;
-        return;
+        return 2;
     }
     output.write(file, static_cast<std::streamsize>(file_length));
     if (!output) {
         std::cerr << "Error: Failed to write output file " << fileName << std::endl;
         delete[] file;
         file = nullptr;
-        return;
+        return 2;
     }
     output.close();
     std::cout << "File successfully received" << std::endl;
 
     delete[] file;
     file = nullptr;
+    return 0;
 }
 
 
-void run() {
+// Returns a process exit code: 0 on success, non-zero on failure.
+int run() {
     bool finish = false; // Sender finished transferring
 
     char* buffer = new (std::nothrow) char[2 * mtu];
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
-        return;
+        return 1;
     }
 
     while (ttl > 0) {
@@ -152,12 +155,11 @@ void run() {
         if (finish) {
             if (file != nullptr) {
                 delete[] buffer;
-                checkParts();
-                return;
+                return checkParts();
             }
             std::cerr << "Error: Received FINISH without NEW_PACKET — joined too late" << std::endl;
             delete[] buffer;
-            return;
+            return 2;
         }
 
         auto length = recvfrom(_socket, buffer, 2 * mtu, 0,
@@ -186,13 +188,13 @@ void run() {
             if (announced == 0) {
                 std::cerr << "Error: Sender announced empty file" << std::endl;
                 delete[] buffer;
-                return;
+                return 2;
             }
             if (announced > MAX_FILE_LENGTH) {
                 std::cerr << "Error: Sender announced file size " << announced
                           << " bytes, exceeds limit of " << MAX_FILE_LENGTH << std::endl;
                 delete[] buffer;
-                return;
+                return 2;
             }
 
             // Sender retransmits NEW_PACKET a few times for robustness; if we
@@ -208,7 +210,7 @@ void run() {
             if (!file) {
                 std::cerr << "Error: Can't allocate " << file_length << " bytes" << std::endl;
                 delete[] buffer;
-                return;
+                return 1;
             }
             memset(file, 0, file_length);
 
@@ -243,9 +245,11 @@ void run() {
             }
         }
     }
+    // ttl exhausted before FINISH: the transfer did not complete.
     delete[] buffer;
     delete[] file;
     file = nullptr;
+    return 2;
 }
 
 } //namespace Receiver
