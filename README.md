@@ -46,19 +46,19 @@ directly. No installation required.
 **Sender** (host that has the file):
 
 ```sh
-./filecast --type sender --file photo.jpg
+./filecast send photo.jpg
 ```
 
 **Receiver** (one or more hosts on the same LAN):
 
 ```sh
-./filecast --type receiver --file photo.jpg
+./filecast receive photo.jpg
 ```
 
 Send to a specific host instead of broadcasting to the whole LAN:
 
 ```sh
-./filecast --type sender --file photo.jpg --broadcast 192.168.1.50
+./filecast send photo.jpg --to 192.168.1.50
 ```
 
 ## Installation
@@ -68,13 +68,19 @@ attached to every [GitHub Release](https://github.com/gistrec/filecast/releases)
 
 If your platform isn't covered, see [Building from Source](#building-from-source).
 
+## Usage
+
+```sh
+filecast send <file> [options]       # broadcast a file to the LAN
+filecast receive [file] [options]    # receive a file (default: file.out)
+```
+
 ## Parameters
 
 | Parameter | Default | Range | Description |
 | --------- | ------- | ----- | ----------- |
-| `-f, --file`  | `file.out` | — | File to send or save |
-| `-t, --type`  | `sender`   | `sender` / `receiver` | Run mode |
-| `--broadcast` | `yes`      | `yes` or IPv4 | `yes` for LAN broadcast, or a specific IP for unicast |
+| `<file>` (positional) | — (send) / `file.out` (receive) | — | File to send, or where to save it. `-f, --file` is an alias |
+| `--to`        | broadcast  | IPv4 | Send to one host instead of LAN broadcast |
 | `-p, --port`  | `33333`    | 1..65535 | Destination port for outgoing packets |
 | `--bind-port` | `33333`    | 1..65535 | Local port to bind on |
 | `--mtu`       | `1500`     | 64..65507 | Max packet size in bytes |
@@ -89,20 +95,20 @@ If your platform isn't covered, see [Building from Source](#building-from-source
 
 ```sh
 # On the sender host
-./filecast --type sender --file album.zip
+./filecast send album.zip
 
 # On every receiver host
-./filecast --type receiver --file album.zip
+./filecast receive album.zip
 ```
 
 **Targeted unicast** (when broadcast is blocked or you only have one receiver):
 
 ```sh
 # On the sender host (sends data to 10.0.0.42)
-./filecast --type sender --file album.zip --broadcast 10.0.0.42
+./filecast send album.zip --to 10.0.0.42
 
-# On 10.0.0.42 (receiver default --broadcast=yes broadcasts RESENDs)
-./filecast --type receiver --file album.zip
+# On 10.0.0.42 (receiver broadcasts its RESENDs by default)
+./filecast receive album.zip
 ```
 
 **Loopback test** (sender and receiver on the same host — useful for
@@ -110,12 +116,12 @@ development):
 
 ```sh
 # Receiver listens on 33401, sends RESEND back to the sender's bind port (33402)
-./filecast --type receiver --file out.bin \
-           --broadcast 127.0.0.1 --port 33402 --bind-port 33401 &
+./filecast receive out.bin \
+           --to 127.0.0.1 --port 33402 --bind-port 33401 &
 
 # Sender listens on 33402, sends data to the receiver's bind port (33401)
-./filecast --type sender --file in.bin \
-           --broadcast 127.0.0.1 --port 33401 --bind-port 33402
+./filecast send in.bin \
+           --to 127.0.0.1 --port 33401 --bind-port 33402
 ```
 
 ## How It Works

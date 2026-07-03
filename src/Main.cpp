@@ -2,6 +2,7 @@
 #include "Config.hpp"
 
 #include <iostream>
+#include <ostream>
 #include <string>
 #include <cstdlib>
 
@@ -23,36 +24,78 @@ static void cleanupAndExit(int code) {
 
 
 int main(int argc, char* argv[]) {
-    // Parsing input parameters from the CLI
-    cxxopts::Options options("filecast", "UDP broadcast file transfer over LAN");
+    // The interface is subcommand-based: `filecast send <file>` /
+    // `filecast receive [file]`. cxxopts has no native subcommands, so we peel
+    // the command off argv[1] ourselves and let cxxopts parse the rest (options
+    // plus the positional <file>).
+    cxxopts::Options options("filecast", "Send a file to every host on a LAN at once, over UDP");
 
     options
-        .positional_help("[optional args]")
+        .custom_help("send|receive [options]")
+        .positional_help("<file>")
         .show_positional_help();
 
     options.add_options()
-        ("f,file",     "File name",                             cxxopts::value<std::string>()->default_value("file.out"))
-        ("t,type",     "Receiver or sender",                    cxxopts::value<std::string>()->default_value("sender"))
-        ("broadcast",  "Broadcast address",                     cxxopts::value<std::string>()->default_value("yes"))
-        ("p,port",     "Destination port for outgoing packets", cxxopts::value<int>()->default_value("33333"))
-        ("bind-port",  "Local port to bind on",                 cxxopts::value<int>()->default_value("33333"))
-        ("mtu",        "MTU packet",                            cxxopts::value<int>()->default_value("1500"))
-        ("ttl",        "Time to live",                          cxxopts::value<int>()->default_value("15"))
+        ("f,file",     "File to send, or where to save it when receiving", cxxopts::value<std::string>())
+        ("to",         "Send to this IPv4 address instead of LAN broadcast", cxxopts::value<std::string>())
+        ("p,port",     "Destination UDP port",                  cxxopts::value<int>()->default_value("33333"))
+        ("bind-port",  "Local UDP port to bind on",             cxxopts::value<int>()->default_value("33333"))
+        ("mtu",        "Max packet size in bytes",              cxxopts::value<int>()->default_value("1500"))
+        ("ttl",        "Seconds of silence before giving up",   cxxopts::value<int>()->default_value("15"))
         ("delay-ms",   "Delay between successive packets, ms",  cxxopts::value<int>()->default_value("20"))
         ("h,help",     "Print help")
         ("version",    "Print version");
 
+    options.parse_positional({"file"});
+
+    auto printUsage = [&](std::ostream& os) {
+        os << options.help();
+        os << "\nCommands:\n"
+           << "  send <file>       Broadcast <file> to every host on the LAN\n"
+           << "  receive [file]    Receive a file (saved as [file], default file.out)\n"
+           << "\nExamples:\n"
+           << "  filecast send photo.jpg\n"
+           << "  filecast receive\n"
+           << "  filecast send photo.jpg --to 192.168.1.50\n";
+    };
+
+    // Global help/version before a subcommand: `filecast --help`, `filecast --version`.
+    if (argc < 2) {
+        std::cerr << "Error: no command given.\n\n";
+        printUsage(std::cerr);
+        return 1;
+    }
+    const std::string command = argv[1];
+    if (command == "-h" || command == "--help") {
+        printUsage(std::cout);
+        return 0;
+    }
+    if (command == "--version") {
+        std::cout << "filecast " << FILECAST_VERSION << std::endl;
+        return 0;
+    }
+    if (command != "send" && command != "receive") {
+        std::cerr << "Error: unknown command '" << command << "'. Use 'send' or 'receive'.\n\n";
+        printUsage(std::cerr);
+        return 1;
+    }
+    const bool isSender = (command == "send");
+
+    // Parse everything after the subcommand. Shifting by one makes cxxopts treat
+    // the subcommand token as argv[0] (the program name it ignores), so options
+    // and the positional <file> are parsed from argv[2..].
     auto result = [&]() -> cxxopts::ParseResult {
         try {
-            return options.parse(argc, argv);
+            return options.parse(argc - 1, argv + 1);
         } catch (const cxxopts::exceptions::exception& e) {
             std::cerr << "Error: " << e.what() << std::endl;
             std::exit(1);
         }
     }();
 
+    // `filecast send --help` / `filecast receive --version`.
     if (result.count("help")) {
-        std::cout << options.help() << std::endl;
+        printUsage(std::cout);
         return 0;
     }
     if (result.count("version")) {
@@ -88,13 +131,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const std::string type = result["type"].as<std::string>();
-    if (type != "sender" && type != "receiver") {
-        std::cerr << "Error: --type must be 'sender' or 'receiver'" << std::endl;
+    // `send` needs an explicit file; `receive` defaults to file.out when omitted.
+    if (isSender && !result.count("file")) {
+        std::cerr << "Error: no file to send.\nUsage: filecast send <file>" << std::endl;
         return 1;
     }
+    const std::string parsed_file =
+        result.count("file") ? result["file"].as<std::string>() : "file.out";
 
-    const std::string broadcast_arg = result["broadcast"].as<std::string>();
+    // No --to means LAN broadcast (the default); --to <ip> sends to one host.
+    const bool useBroadcast = (result.count("to") == 0);
+    const std::string target = useBroadcast ? std::string() : result["to"].as<std::string>();
 
     #if defined(_WIN32) || defined(_WIN64)
     WORD socketVer = MAKEWORD(2, 2);
@@ -109,7 +156,7 @@ int main(int argc, char* argv[]) {
     ttl      = parsed_ttl;
     ttl_max  = parsed_ttl;
     delay_ms = parsed_delay_ms;
-    fileName = result["file"].as<std::string>();
+    fileName = parsed_file;
 
     _socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (_socket == INVALID_SOCKET) {
@@ -141,7 +188,7 @@ int main(int argc, char* argv[]) {
     broadcast_address.sin_family = AF_INET;
     broadcast_address.sin_port = htons(static_cast<uint16_t>(parsed_port));
 
-    if (broadcast_arg == "yes") {
+    if (useBroadcast) {
         int broadcastEnable = 1;
         if (setsockopt(_socket, SOL_SOCKET, SO_BROADCAST,
                        reinterpret_cast<const char*>(&broadcastEnable),
@@ -152,8 +199,8 @@ int main(int argc, char* argv[]) {
         std::cout << "Ok: Got access to broadcast" << std::endl;
         broadcast_address.sin_addr.s_addr = INADDR_BROADCAST;
     } else {
-        if (inet_pton(AF_INET, broadcast_arg.c_str(), &broadcast_address.sin_addr) != 1) {
-            std::cerr << "Error: --broadcast must be 'yes' or a valid IPv4 address" << std::endl;
+        if (inet_pton(AF_INET, target.c_str(), &broadcast_address.sin_addr) != 1) {
+            std::cerr << "Error: --to must be a valid IPv4 address" << std::endl;
             cleanupAndExit(1);
         }
     }
@@ -178,7 +225,7 @@ int main(int argc, char* argv[]) {
 
     // Run receiver or sender; propagate its status as the process exit code so
     // automation (deploy scripts, CI, Ansible) can tell success from failure.
-    int rc = (type == "receiver") ? Receiver::run() : Sender::run();
+    int rc = isSender ? Sender::run() : Receiver::run();
 
     CLOSE_SOCKET(_socket);
     CLEANUP_NETWORK();

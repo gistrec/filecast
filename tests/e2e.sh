@@ -41,7 +41,7 @@ run_test() {
     # --delay-ms 0 removes the inter-packet pause that the protocol uses on real
     # LANs to avoid overrunning receivers; on loopback it just slows tests down.
     echo "==> [$label] starting receiver (bind=$recv_port, target=$send_port)"
-    "$BINARY" --type receiver --file "$dst" --broadcast 127.0.0.1 \
+    "$BINARY" receive "$dst" --to 127.0.0.1 \
               --bind-port "$recv_port" --port "$send_port" --ttl "$recv_ttl" \
               --delay-ms 0 \
         > "$recv_log" 2>&1 &
@@ -52,7 +52,7 @@ run_test() {
 
     # Sender listens on $send_port, sends TRANSFER to $recv_port (receiver's bind).
     echo "==> [$label] starting sender (bind=$send_port, target=$recv_port)"
-    if ! "$BINARY" --type sender --file "$src" --broadcast 127.0.0.1 \
+    if ! "$BINARY" send "$src" --to 127.0.0.1 \
                    --bind-port "$send_port" --port "$recv_port" --ttl "$send_ttl" \
                    --delay-ms 0 \
             > "$send_log" 2>&1; then
