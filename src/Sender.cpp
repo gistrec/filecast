@@ -16,6 +16,11 @@ namespace Sender {
 
 constexpr int HEADER_SIZE = 16;
 
+// The file size is announced in a 4-byte field in NEW_PACKET, so anything that
+// does not fit into 32 bits would be silently truncated on the wire (a 4 GiB
+// file would be announced as 0). Reject such files up front instead.
+constexpr size_t MAX_WIRE_FILE_LENGTH = 0xFFFFFFFFULL;
+
 /**
  * Since server may receive many requests for sending some part
  * It is necessary to limit the sending of the same parts for a while
@@ -70,6 +75,17 @@ void run() {
 
     if (file_length == 0) {
         std::cerr << "Error: File is empty" << std::endl;
+        delete[] buffer;
+        buffer = nullptr;
+        CLOSE_SOCKET(_socket);
+        CLEANUP_NETWORK();
+        exit(-1);
+    }
+
+    if (file_length > MAX_WIRE_FILE_LENGTH) {
+        std::cerr << "Error: File is too large (" << file_length
+                  << " bytes); the 4-byte wire format supports at most "
+                  << MAX_WIRE_FILE_LENGTH << " bytes" << std::endl;
         delete[] buffer;
         buffer = nullptr;
         CLOSE_SOCKET(_socket);
