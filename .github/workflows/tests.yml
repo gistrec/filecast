@@ -63,6 +63,51 @@ jobs:
             ctest --test-dir build --output-on-failure
           fi
 
+  # install.sh is the README's headline install path and only ever runs on
+  # user machines, so exercise it here: lint, pin the asset-name contract it
+  # shares with release.yml, and round-trip it against a mock release server
+  # (including rejecting a tampered download).
+  install-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint (POSIX sh)
+        run: shellcheck -s sh install.sh
+
+      - name: Asset names match release.yml
+        run: |
+          # install.sh builds the Linux names from a template; the mock round
+          # trip below exercises the real filecast-linux-x86_64 construction.
+          for pat in 'filecast-linux-${arch}' 'filecast-macos-universal' \
+                     'filecast-windows-x86_64.exe'; do
+            grep -qF -- "$pat" install.sh || { echo "install.sh misses $pat"; exit 1; }
+          done
+          for n in filecast-linux-x86_64 filecast-linux-arm64 \
+                   filecast-macos-universal filecast-windows-x86_64.exe; do
+            grep -q "asset_name: $n" .github/workflows/release.yml \
+              || { echo "release.yml misses $n"; exit 1; }
+          done
+
+      - name: Mock-release round trip
+        run: |
+          mkdir -p mock/latest/download
+          printf '#!/bin/sh\necho filecast v9.9.9\n' > mock/latest/download/filecast-linux-x86_64
+          # Same command the release workflow uses to publish checksums.txt.
+          (cd mock/latest/download && sha256sum -- * > checksums.txt)
+          python3 -m http.server 8000 --directory mock &
+          sleep 1
+          FILECAST_DOWNLOAD_BASE=http://127.0.0.1:8000 BIN_DIR="$PWD/bin" sh install.sh
+          ./bin/filecast --version | grep -q 9.9.9
+
+      - name: Tampered download is rejected
+        run: |
+          echo tamper >> mock/latest/download/filecast-linux-x86_64
+          if FILECAST_DOWNLOAD_BASE=http://127.0.0.1:8000 BIN_DIR="$PWD/bin2" sh install.sh; then
+            echo "tampered download was installed"; exit 1
+          fi
+          test ! -e bin2/filecast
+
   # Build with AddressSanitizer + UndefinedBehaviorSanitizer and run the whole
   # suite, so memory errors and UB in the manual buffer handling are caught in CI.
   sanitizers:

@@ -1,81 +1,129 @@
+<div align="center">
+
 # Filecast
 
-<p align="left">
+**Send a file to every machine on your LAN at once.**
+One sender, any number of receivers, no internet required.
+
+<p>
     <a href="https://github.com/gistrec/filecast/actions/workflows/tests.yml">
         <img src="https://github.com/gistrec/filecast/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
-    <a>
-      <img src="https://img.shields.io/codacy/grade/4c8169bcab3a4df18baad4e5658ec8ce" alt="Code quality"></a>
+    <a href="https://app.codacy.com/gh/gistrec/Filecast/dashboard">
+        <img src="https://img.shields.io/codacy/grade/4c8169bcab3a4df18baad4e5658ec8ce" alt="Code quality"></a>
     <a href="https://github.com/gistrec/filecast/releases">
         <img src="https://img.shields.io/github/v/release/gistrec/filecast" alt="Release"></a>
-    <a>
-      <img src="https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-brightgreen" alt="Platform"></a>
+    <img src="https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-brightgreen" alt="Platform">
     <a href="https://github.com/gistrec/filecast/blob/master/LICENSE">
         <img src="https://img.shields.io/github/license/gistrec/filecast?color=brightgreen" alt="License"></a>
 </p>
 
-UDP broadcast file transfer — sends a single file to every host on the same
-LAN at once, with automatic retransmission of dropped packets.
+<img src="docs/demo.gif" alt="One filecast sender delivering a file to three receivers simultaneously" width="1000">
 
-## Table of Contents
+<sub>One transfer, three receivers. Recorded on a single machine over the
+loopback interface (hence <code>--multicast</code>/<code>--iface</code>; on a
+real LAN receivers just run <code>filecast receive</code>) —
+<a href="docs/demo.tape">demo.tape</a>.</sub>
 
-- [Features](#features)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Parameters](#parameters)
-- [Examples](#examples)
-- [How It Works](#how-it-works)
-- [Packet Structure](#packet-structure)
-- [Limitations](#limitations)
-- [Building from Source](#building-from-source)
-- [License](#license)
+</div>
 
-## Features
+## Why filecast
 
-- Broadcast to every host on a LAN with a single transmission
-- Unicast mode for point-to-point transfer, and IP multicast for one-to-many
-  without flooding the whole VLAN
-- Automatic retransmission of lost packets
-- End-to-end SHA-256 integrity check — a corrupted file is rejected, not saved
-- File name travels with the transfer, so `receive` needs no arguments
-- Chunk size negotiated in-band, so mismatched `--mtu` no longer stalls
-- Live progress bar with speed and ETA, and a rate limit in Mbit/s
-- Never clobbers an existing file unless you pass `--overwrite`
-- Resumable: an interrupted receive can pick up where it left off with `--resume`
-- Windows, Linux, and macOS binaries built on every release
+- **One-to-many in a single transfer** — UDP broadcast or IP multicast; the
+  network carries each byte once, so 40 machines take about the same time as
+  one on a wired LAN
+- **Fully offline** — no relay, no rendezvous server, no account; nothing
+  leaves your network
+- **Single small binary** for Windows, Linux, and macOS — receivers need zero
+  setup: run `filecast receive`, done
+- **Loss-tolerant** — receivers request dropped packets, and one
+  retransmission repairs every receiver that missed the part
+- **SHA-256 verified** — a corrupted file is rejected, not saved; an existing
+  file is never overwritten unless you pass `--overwrite`
+- **Resumable** — an interrupted receive picks up where it left off with
+  `--resume`
+- **Live progress** — speed, ETA, and a tunable target rate in Mbit/s
+  (`--rate`)
+- **No encryption yet** — filecast assumes a trusted LAN; see
+  [Limitations](#limitations)
 
 ## Quick Start
-
-Download the binary for your platform from the
-[releases page](https://github.com/gistrec/filecast/releases) and run it
-directly. No installation required.
 
 **Sender** (host that has the file):
 
 ```sh
-./filecast send photo.jpg
+filecast send photo.jpg
 ```
 
 **Receiver** (one or more hosts on the same LAN):
 
 ```sh
-./filecast receive
+filecast receive
 ```
 
 The file is saved under the name the sender announced (pass a path to override
-it, e.g. `./filecast receive my-photo.jpg`).
+it, e.g. `filecast receive my-photo.jpg`).
 
 Send to a specific host instead of broadcasting to the whole LAN:
 
 ```sh
-./filecast send photo.jpg --to 192.168.1.50
+filecast send photo.jpg --to 192.168.1.50
 ```
 
 ## Installation
 
-Pre-built binaries for Linux x86_64, macOS arm64, and Windows x86_64 are
-attached to every [GitHub Release](https://github.com/gistrec/filecast/releases).
+**One-liner** (Linux, macOS):
 
-If your platform isn't covered, see [Building from Source](#building-from-source).
+```sh
+curl -fsSL https://raw.githubusercontent.com/gistrec/Filecast/master/install.sh | sh
+```
+
+The script picks the prebuilt binary for your platform from the latest
+[GitHub Release](https://github.com/gistrec/filecast/releases), verifies its
+SHA-256 against the release's `checksums.txt`, and installs it to
+`/usr/local/bin`. On Git Bash for Windows (no sudo), point it at a directory
+you own:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gistrec/Filecast/master/install.sh | BIN_DIR="$HOME/bin" sh
+```
+
+**Manual**: download a binary from the
+[releases page](https://github.com/gistrec/filecast/releases) — Linux
+x86_64/arm64, macOS (universal), Windows x86_64 — and run it directly. No
+installation required.
+
+If your platform isn't covered, see
+[Building from Source](#building-from-source).
+
+## Use Cases
+
+- **Air-gapped and offline networks** — distribute files with no cloud, no
+  server, and no per-machine configuration
+- **Classrooms and training labs** — push exercise files to every student
+  machine in one go
+- **Fleet provisioning** — drop an installer or a patch onto a rack of
+  machines simultaneously
+- **LAN parties** — everyone gets the mod in the time of one transfer
+
+One file per run, up to 4 GiB — the whole file is buffered in RAM on each
+side (see [Limitations](#limitations)).
+
+## How It Compares
+
+As far as we know, filecast is the only file-transfer tool that combines
+**all** of the following:
+
+- sends one file to **many machines in a single transfer** (UDP
+  broadcast/multicast),
+- **cross-platform** prebuilt binaries — Windows, macOS, and Linux,
+- works **fully offline** — no relay or rendezvous server,
+- **zero receiver setup** — no daemon, no keys, no config file,
+- **resumes** an interrupted receive,
+- verifies every file **end-to-end with SHA-256**.
+
+udpcast, UFTP, croc, LocalSend, and magic-wormhole each cover part of that
+list — see the sourced feature table in [docs/COMPARISON.md](docs/COMPARISON.md),
+including what they do better (encryption, internet transfer, mobile apps).
 
 ## Usage
 
@@ -110,20 +158,20 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 
 ```sh
 # On the sender host
-./filecast send album.zip
+filecast send album.zip
 
 # On every receiver host
-./filecast receive album.zip
+filecast receive album.zip
 ```
 
 **Targeted unicast** (when broadcast is blocked or you only have one receiver):
 
 ```sh
 # On the sender host (sends data to 10.0.0.42)
-./filecast send album.zip --to 10.0.0.42
+filecast send album.zip --to 10.0.0.42
 
 # On 10.0.0.42 (receiver broadcasts its RESENDs by default)
-./filecast receive album.zip
+filecast receive album.zip
 ```
 
 **IP multicast** (one-to-many without flooding every host on the VLAN — NICs of
@@ -132,18 +180,18 @@ only to subscribers). Sender and every receiver use the same group:
 
 ```sh
 # On the sender host
-./filecast send album.zip --multicast 239.1.2.3
+filecast send album.zip --multicast 239.1.2.3
 
 # On every receiver host (same group)
-./filecast receive album.zip --multicast 239.1.2.3
+filecast receive album.zip --multicast 239.1.2.3
 ```
 
 On a multi-homed host (several NICs), pin the group to a specific interface by
 its local IPv4 so the kernel doesn't pick the wrong one:
 
 ```sh
-./filecast send album.zip --multicast 239.1.2.3 --iface 192.168.1.10
-./filecast receive album.zip --multicast 239.1.2.3 --iface 192.168.1.10
+filecast send album.zip --multicast 239.1.2.3 --iface 192.168.1.10
+filecast receive album.zip --multicast 239.1.2.3 --iface 192.168.1.10
 ```
 
 **Loopback test** (sender and receiver on the same host — useful for
@@ -151,41 +199,23 @@ development):
 
 ```sh
 # Receiver listens on 33401, sends RESEND back to the sender's bind port (33402)
-./filecast receive out.bin \
-           --to 127.0.0.1 --port 33402 --bind-port 33401 &
+filecast receive out.bin \
+         --to 127.0.0.1 --port 33402 --bind-port 33401 &
 
 # Sender listens on 33402, sends data to the receiver's bind port (33401)
-./filecast send in.bin \
-           --to 127.0.0.1 --port 33401 --bind-port 33402
+filecast send in.bin \
+         --to 127.0.0.1 --port 33401 --bind-port 33402
 ```
 
 ## How It Works
 
-1. Sender broadcasts a `NEW_PACKET` announcing a random session id, the total
-   file size, the chunk size, the file's SHA-256, and its name.
-2. Each receiver latches that session, allocates a buffer, and clears its part
-   registry. Packets from any other session are ignored.
-3. Sender splits the file into chunk-sized pieces and broadcasts each one as a
-   `TRANSFER` packet, tagged with the session id.
-4. Sender broadcasts a `FINISH` packet when all chunks have been sent.
-5. Each receiver scans for missing chunks and requests them with `RESEND`
-   packets.
-6. Sender retransmits each requested chunk.
-7. Steps 5–6 repeat until every chunk is received or the TTL expires.
-8. The receiver recomputes the SHA-256 of the reassembled file and only writes
-   it out if the digest matches; otherwise it reports corruption and fails.
+The sender announces the file — size, SHA-256, name, and a random session id —
+then broadcasts it in MTU-sized chunks. After the announcement's `FINISH`
+marker, each receiver requests the chunks it missed, and every retransmission
+repairs all receivers that missed that part at once. The file is written out
+(atomically) only after its SHA-256 matches the announcement.
 
-## Packet Structure
-
-All multi-byte fields are big-endian. Every packet carries the 32-bit session id
-so a receiver ignores traffic from a different (or restarted) sender.
-
-| Packet | Layout |
-| ------ | ------ |
-| `NEW_PACKET` | `"NEW_PACKET"` · version(2) · session(4) · file_size(4) · chunk_size(4) · sha256(32) · name_len(2) · name |
-| `TRANSFER` | `"TRANSFER"` · session(4) · part(4) · length(4) · data |
-| `FINISH` | `"FINISH"` · session(4) |
-| `RESEND` | `"RESEND"` · session(4) · part(4) |
+The full wire format lives in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Resuming an Interrupted Transfer
 
@@ -196,7 +226,7 @@ off — the transfer is matched by the file's SHA-256, so it works even if the
 sender is restarted (a new session):
 
 ```sh
-./filecast receive album.zip --resume
+filecast receive album.zip --resume
 ```
 
 The snapshot is deleted once the file completes and its checksum verifies.
@@ -215,7 +245,12 @@ The snapshot is deleted once the file completes and its checksum verifies.
 - No authentication. Any host on the same LAN can send a `NEW_PACKET` and any
   receiver bound to the chosen port will accept it. The SHA-256 check catches
   accidental corruption, not a deliberately crafted stream.
-- No encryption. The payload travels as plaintext UDP.
+- No encryption yet. The payload travels as plaintext UDP; treat the LAN as
+  trusted.
+- Designed for wired LANs. Wi-Fi access points transmit broadcast/multicast
+  frames at a low basic rate without link-layer ACKs, so expect heavy loss
+  over wireless. The sender's rate limit is open-loop (no congestion
+  feedback) — pick `--rate` with your network in mind.
 
 ## Building from Source
 
