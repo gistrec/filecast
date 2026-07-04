@@ -210,10 +210,10 @@ filecast send in.bin \
 ## How It Works
 
 The sender announces the file — size, SHA-256, name, and a random session id —
-then broadcasts it in MTU-sized chunks. After the announcement's `FINISH`
-marker, each receiver requests the chunks it missed, and every retransmission
-repairs all receivers that missed that part at once. The file is written out
-(atomically) only after its SHA-256 matches the announcement.
+then broadcasts it in MTU-sized chunks. Once the sender signals `FINISH`, each
+receiver requests the chunks it missed, and every retransmission repairs all
+receivers that missed that part at once. The file is written out (atomically)
+only after its SHA-256 matches the announcement.
 
 The full wire format lives in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
@@ -242,7 +242,7 @@ The snapshot is deleted once the file completes and its checksum verifies.
   interrupting a multi-gigabyte transfer adds a short exit delay while it flushes.
   The `.part`/`.part.idx` files use stable, predictable names in the working
   directory, so run the receiver from a directory only you can write to.
-- No authentication. Any host on the same LAN can send a `NEW_PACKET` and any
+- No authentication. Any host on the same LAN can announce a transfer and any
   receiver bound to the chosen port will accept it. The SHA-256 check catches
   accidental corruption, not a deliberately crafted stream.
 - No encryption yet. The payload travels as plaintext UDP; treat the LAN as

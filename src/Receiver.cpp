@@ -48,25 +48,28 @@ void installSignalHandlers() {
 // only if you know the receiver has enough memory.
 constexpr size_t MAX_FILE_LENGTH = 4ULL * 1024 * 1024 * 1024; // 4 GiB
 
-// Wire protocol the receiver speaks; a NEW_PACKET with any other version is
-// rejected rather than misparsed.
-constexpr uint16_t PROTOCOL_VERSION = 2;
-
-// NEW_PACKET v2 fixed header (see Sender.cpp) and the TRANSFER header size.
-constexpr size_t NEW_PACKET_FIXED = 58;
-constexpr size_t TRANSFER_HEADER  = 20;
-
 // Session the receiver is currently bound to. The sender stamps a random id into
-// every packet; we latch it from the first NEW_PACKET and then reject packets
+// every packet; we latch it from the first ANNOUNCE and then reject packets
 // from any other session, so a second sender (or a restarted one) cannot mix a
 // different file into our buffer and have us report success on garbage.
-size_t session_id   = 0;
-bool   have_session = false;
+uint32_t session_id   = 0;
+bool     have_session = false;
 
-// Chunk size (the sender's MTU) announced in NEW_PACKET. The receiver slices the
+// Chunk size (the sender's MTU) from the ANNOUNCE. The receiver slices the
 // file by this value rather than its own --mtu, so a sender/receiver MTU
 // mismatch no longer live-locks the transfer.
 size_t chunk_size = 0;
+
+// A packet with our magic but a foreign protocol version is dropped; report it
+// once per run so a version-mixed LAN is diagnosable without a warning storm.
+void warnVersionOnce(uint8_t seen) {
+    static bool warned = false;
+    if (warned) return;
+    warned = true;
+    std::cerr << "Warning: ignoring packets with protocol version "
+              << static_cast<int>(seen) << " (this build speaks "
+              << static_cast<int>(Protocol::VERSION) << ")" << std::endl;
+}
 
 // SHA-256 of the whole file, announced by the sender and checked after reassembly.
 uint8_t expected_hash[32] = {0};
@@ -100,15 +103,19 @@ std::vector<size_t> getEmptyParts() {
     return result;
 }
 
-// Validate and store one TRANSFER packet. Returns true when a new part was
-// stored (shared by the main loop and the recovery loop so their validation
-// can never drift apart).
+// Validate and store one TRANSFER packet, parsing it from scratch — the packet
+// may come from the main loop or the recovery loop, and full self-validation
+// keeps the two call sites from ever drifting apart. Returns true when a new
+// part was stored.
 bool handleTransfer(const char* buf, int64_t length) {
-    if (length < static_cast<int64_t>(TRANSFER_HEADER)) return false;
-    if (Utils::getNumberFromBytes(buf + 8, 4) != session_id) return false;
+    Protocol::Header h;
+    if (Protocol::parseHeader(buf, static_cast<size_t>(length), h) != Protocol::Parse::Ok) return false;
+    if (h.type != Protocol::Type::Transfer) return false;
+    if (length < static_cast<int64_t>(Protocol::TRANSFER_HEADER)) return false;
+    if (h.session != session_id) return false;
 
-    size_t part  = Utils::getNumberFromBytes(buf + 12, 4);
-    size_t size  = Utils::getNumberFromBytes(buf + 16, 4);
+    size_t part  = Protocol::getU32(buf + Protocol::HEADER_SIZE);
+    size_t size  = Protocol::getU32(buf + Protocol::HEADER_SIZE + 4);
     size_t total = totalParts();
     if (part >= total) return false;
     if (parts.find(part) != parts.end()) return false;
@@ -117,10 +124,10 @@ bool handleTransfer(const char* buf, int64_t length) {
     // must equal the remaining bytes. Anything else is malformed and would
     // either silently zero-pad data or write past the file buffer.
     if (size != Protocol::expectedPartSize(part, file_length, chunk_size)) return false;
-    if (static_cast<size_t>(length) < size + TRANSFER_HEADER) return false;
+    if (static_cast<size_t>(length) < size + Protocol::TRANSFER_HEADER) return false;
 
     parts.insert(part);
-    memcpy(file + part * chunk_size, buf + TRANSFER_HEADER, size);
+    memcpy(file + part * chunk_size, buf + Protocol::TRANSFER_HEADER, size);
     received_bytes += size;
     reporter.update(received_bytes);
     if (verbose) std::cout << "Receive " << part << " part with size " << size << std::endl;
@@ -484,7 +491,7 @@ int verifyAndWrite() {
  */
 // Returns a process exit code: 0 on success, non-zero on failure.
 int checkParts() {
-    size_t bufcap = std::max(chunk_size + TRANSFER_HEADER, static_cast<size_t>(2048));
+    size_t bufcap = std::max(chunk_size + Protocol::TRANSFER_HEADER, static_cast<size_t>(2048));
     char* buffer = new (std::nothrow) char[bufcap];
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
@@ -498,10 +505,10 @@ int checkParts() {
     while (ttl && !emptyParts.empty()) {
         if (g_interrupted) return onInterrupt(buffer);
         for (auto index : emptyParts) {
-            snprintf(buffer, 7, "RESEND");
-            Utils::writeBytesFromNumber(buffer +  6, session_id, 4);
-            Utils::writeBytesFromNumber(buffer + 10, index,      4);
-            sendto(_socket, buffer, 14, 0, reinterpret_cast<sockaddr*>(&broadcast_address),
+            Protocol::writeHeader(buffer, Protocol::Type::Resend, session_id);
+            Protocol::putU32(buffer + Protocol::HEADER_SIZE, static_cast<uint32_t>(index));
+            sendto(_socket, buffer, static_cast<int>(Protocol::RESEND_SIZE), 0,
+                   reinterpret_cast<sockaddr*>(&broadcast_address),
                    sizeof(broadcast_address));
             if (verbose) std::cout << "Request part of file with index " << index << std::endl;
             if (pace_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
@@ -521,8 +528,17 @@ int checkParts() {
             auto length = recvfrom(_socket, buffer, static_cast<int>(bufcap), 0,
                                    reinterpret_cast<sockaddr*>(&sender_address),
                                    &sender_address_length);
-            if (length <= 0) break;                              // queue drained this round
-            if (strncmp(buffer, "TRANSFER", 8) != 0) continue;   // e.g. our own RESEND
+            if (length <= 0) break;  // queue drained this round
+            // A foreign protocol version deserves its one warning even when it
+            // first shows up during recovery; everything else that is not a
+            // TRANSFER for our session (e.g. our own looped-back RESENDs) is
+            // rejected by handleTransfer's own validation.
+            Protocol::Header h;
+            if (Protocol::parseHeader(buffer, static_cast<size_t>(length), h) ==
+                Protocol::Parse::BadVersion) {
+                warnVersionOnce(h.version);
+                continue;
+            }
             if (handleTransfer(buffer, static_cast<int64_t>(length))) progressed = true;
         }
 
@@ -569,7 +585,7 @@ bool announceValid(size_t announced, size_t chunk, int& exit_code) {
 
 // Grow the receive buffer so it can hold a full chunk for this transfer.
 bool growRecvBuffer(char*& buf, size_t& bufcap, int& exit_code) {
-    size_t need = chunk_size + TRANSFER_HEADER;
+    size_t need = chunk_size + Protocol::TRANSFER_HEADER;
     if (need > bufcap) {
         delete[] buf;
         bufcap = need;
@@ -607,28 +623,25 @@ bool prepareStorage(char*& buf, size_t& bufcap, size_t announced, size_t chunk,
     return true;
 }
 
-// Parse and latch a NEW_PACKET. Sets exit_code and returns false if the caller
-// should return that code; returns true to continue the receive loop. buf may be
-// reallocated to fit the announced chunk size.
-bool handleNewPacket(char*& buf, size_t& bufcap, int64_t length, int& exit_code) {
-    if (length < static_cast<int64_t>(NEW_PACKET_FIXED)) return true;  // too short, ignore
-    if (Utils::getNumberFromBytes(buf + 10, 2) != PROTOCOL_VERSION) {
-        std::cerr << "Warning: ignoring NEW_PACKET with unsupported protocol version" << std::endl;
-        return true;
-    }
+// Parse and latch an ANNOUNCE (the session id comes pre-parsed from the common
+// header). Sets exit_code and returns false if the caller should return that
+// code; returns true to continue the receive loop. buf may be reallocated to
+// fit the announced chunk size.
+bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incoming_sid,
+                    int& exit_code) {
+    if (length < static_cast<int64_t>(Protocol::ANNOUNCE_FIXED)) return true;  // too short, ignore
 
-    size_t incoming_sid = Utils::getNumberFromBytes(buf + 12, 4);
-    // A NEW_PACKET from a different session (a second sender, or our own sender
+    // An ANNOUNCE from a different session (a second sender, or our own sender
     // restarted) must not clobber the transfer already in progress.
     if (have_session && incoming_sid != session_id) {
-        std::cerr << "Warning: ignoring NEW_PACKET from another sender session" << std::endl;
+        std::cerr << "Warning: ignoring announcement from another sender session" << std::endl;
         return true;
     }
 
-    size_t announced   = Utils::getNumberFromBytes(buf + 16, 4);
-    size_t incoming_cs = Utils::getNumberFromBytes(buf + 20, 4);
-    size_t name_len    = Utils::getNumberFromBytes(buf + 56, 2);
-    if (static_cast<size_t>(length) < NEW_PACKET_FIXED + name_len) return true;  // truncated
+    size_t announced   = Protocol::getU32(buf + Protocol::HEADER_SIZE);
+    size_t incoming_cs = Protocol::getU32(buf + Protocol::HEADER_SIZE + 4);
+    size_t name_len    = Protocol::getU16(buf + Protocol::HEADER_SIZE + 40);
+    if (static_cast<size_t>(length) < Protocol::ANNOUNCE_FIXED + name_len) return true;  // truncated
 
     // Only a recognised packet from our sender refreshes ttl. Unrecognised
     // traffic (stray broadcasts, other receivers' RESENDs, garbage) deliberately
@@ -638,15 +651,15 @@ bool handleNewPacket(char*& buf, size_t& bufcap, int64_t length, int& exit_code)
 
     if (!announceValid(announced, incoming_cs, exit_code)) return false;
 
-    // Duplicate retransmission of the same NEW_PACKET: keep accumulated parts.
+    // Duplicate retransmission of the same ANNOUNCE: keep accumulated parts.
     if (file != nullptr && announced == file_length && incoming_cs == chunk_size) return true;
 
     session_id   = incoming_sid;
     have_session = true;
     file_length  = announced;
     chunk_size   = incoming_cs;
-    memcpy(expected_hash, buf + 24, 32);
-    announced_name = Protocol::sanitizeName(std::string(buf + NEW_PACKET_FIXED, name_len));
+    memcpy(expected_hash, buf + Protocol::HEADER_SIZE + 8, 32);
+    announced_name = Protocol::sanitizeName(std::string(buf + Protocol::ANNOUNCE_FIXED, name_len));
     if (!fileNameFromCli) fileName = announced_name;
 
     bool resumed = false;
@@ -668,9 +681,11 @@ bool handleNewPacket(char*& buf, size_t& bufcap, int64_t length, int& exit_code)
 
 
 // Latch the "sender finished" state from a FINISH packet for our session.
-void handleFinish(const char* buf, int64_t length, bool& finish) {
-    if (length < 10) return;
-    if (Utils::getNumberFromBytes(buf + 6, 4) != session_id) return;
+// The have_session gate matters: session_id starts at 0, so without it a forged
+// FINISH with session 0 would terminate any receiver still waiting for its
+// ANNOUNCE (a one-packet unauthenticated DoS).
+void handleFinish(uint32_t incoming_sid, bool& finish) {
+    if (!have_session || incoming_sid != session_id) return;
     ttl = ttl_max;
     if (!finish) {
         if (verbose) std::cout << "Server finished transferring" << std::endl;
@@ -682,13 +697,31 @@ void handleFinish(const char* buf, int64_t length, bool& finish) {
 // receiving; any value >= 0 is a process exit code the caller should return
 // after freeing its buffers. buf may be reallocated to fit the announced chunk.
 int dispatchPacket(char*& buf, size_t& bufcap, int64_t length, bool& finish) {
-    if (strncmp(buf, "NEW_PACKET", 10) == 0) {
-        int exit_code = 0;
-        if (!handleNewPacket(buf, bufcap, length, exit_code)) return exit_code;
-    } else if (strncmp(buf, "TRANSFER", 8) == 0 && file != nullptr) {
-        if (handleTransfer(buf, length)) ttl = ttl_max;
-    } else if (strncmp(buf, "FINISH", 6) == 0) {
-        handleFinish(buf, length, finish);
+    Protocol::Header h;
+    switch (Protocol::parseHeader(buf, static_cast<size_t>(length), h)) {
+        case Protocol::Parse::NotOurs:
+            return -1;  // stray traffic on our port — not even worth a warning
+        case Protocol::Parse::BadVersion:
+            warnVersionOnce(h.version);
+            return -1;
+        case Protocol::Parse::Ok:
+            break;
+    }
+
+    switch (h.type) {
+        case Protocol::Type::Announce: {
+            int exit_code = 0;
+            if (!handleAnnounce(buf, bufcap, length, h.session, exit_code)) return exit_code;
+            break;
+        }
+        case Protocol::Type::Transfer:
+            if (file != nullptr && handleTransfer(buf, length)) ttl = ttl_max;
+            break;
+        case Protocol::Type::Finish:
+            handleFinish(h.session, finish);
+            break;
+        default:
+            break;  // other receivers' RESENDs, or an unknown type: ignore
     }
     return -1;
 }
@@ -712,13 +745,13 @@ int run() {
     while (ttl > 0) {
         if (g_interrupted) return onInterrupt(buffer);
         // Sender finished transferring — move to the recovery phase (or bail if
-        // we joined too late to ever have received NEW_PACKET).
+        // we joined too late to ever have received the ANNOUNCE).
         if (finish) {
             if (file != nullptr) {
                 delete[] buffer;
                 return checkParts();
             }
-            std::cerr << "Error: Received FINISH without NEW_PACKET — joined too late" << std::endl;
+            std::cerr << "Error: Received FINISH without an ANNOUNCE — joined too late" << std::endl;
             delete[] buffer;
             return 2;
         }
