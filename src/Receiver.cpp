@@ -2,6 +2,7 @@
 #include "Config.hpp"
 #include "Sha256.hpp"
 #include "Progress.hpp"
+#include "Protocol.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -11,10 +12,16 @@
 #include <cstdio>
 #include <cstdint>
 #include <cctype>
+#include <cerrno>
 #include <string>
 #include <algorithm>
+#include <random>
 #include <vector>
 #include <set>
+
+#if !defined(_WIN32) && !defined(_WIN64)
+#include <fcntl.h>   // open, O_EXCL, O_NOFOLLOW
+#endif
 
 using namespace std::chrono_literals;
 
@@ -63,7 +70,7 @@ size_t received_bytes = 0;
 std::set<size_t> parts;
 
 size_t totalParts() {
-    return (file_length + chunk_size - 1) / chunk_size;
+    return Protocol::totalParts(file_length, chunk_size);
 }
 
 /**
@@ -76,33 +83,6 @@ std::vector<size_t> getEmptyParts() {
         if (parts.find(i) == parts.end()) result.push_back(i);
     }
     return result;
-}
-
-// A Windows reserved device name (CON, NUL, COM1..9, LPT1..9, ...), optionally
-// with an extension. Opening such a name writes to a device, not a file.
-bool isReservedDeviceName(const std::string& name) {
-    std::string stem = name.substr(0, name.find('.'));
-    std::transform(stem.begin(), stem.end(), stem.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL") return true;
-    if (stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) &&
-        stem[3] >= '1' && stem[3] <= '9') {
-        return true;
-    }
-    return false;
-}
-
-// Keep only the base name of a sender-supplied path and refuse anything that
-// could escape the working directory, so a hostile sender cannot make us write
-// elsewhere. Besides '/' and '\\', a ':' on Windows introduces a drive-relative
-// path or an alternate data stream, and reserved names map to devices.
-std::string sanitizeName(const std::string& raw) {
-    size_t slash = raw.find_last_of("/\\");
-    std::string name = (slash == std::string::npos) ? raw : raw.substr(slash + 1);
-    if (name.empty() || name == "." || name == "..") return "file.out";
-    if (name.find(':') != std::string::npos) return "file.out";
-    if (isReservedDeviceName(name)) return "file.out";
-    return name;
 }
 
 // Validate and store one TRANSFER packet. Returns true when a new part was
@@ -121,10 +101,7 @@ bool handleTransfer(const char* buf, int64_t length) {
     // For non-final parts size must equal the chunk size; for the final part it
     // must equal the remaining bytes. Anything else is malformed and would
     // either silently zero-pad data or write past the file buffer.
-    size_t expected = (part + 1 < total)
-        ? chunk_size
-        : (file_length - part * chunk_size);
-    if (size != expected) return false;
+    if (size != Protocol::expectedPartSize(part, file_length, chunk_size)) return false;
     if (static_cast<size_t>(length) < size + TRANSFER_HEADER) return false;
 
     parts.insert(part);
@@ -138,6 +115,64 @@ bool handleTransfer(const char* buf, int64_t length) {
 bool fileExists(const std::string& path) {
     std::ifstream f(path);
     return f.good();
+}
+
+// Write len bytes to a randomly-named temp beside `target`, then rename onto it.
+// The random suffix keeps a hostile sender from predicting the temp path, and on
+// POSIX O_EXCL|O_NOFOLLOW means a symlink planted at that path is never followed.
+// Returns a process exit code; on rename failure the verified temp is kept.
+int writeVerified(const std::string& target, const char* data, size_t len) {
+    std::random_device rd;
+    char suffix[24];
+    snprintf(suffix, sizeof(suffix), ".part.%08x%08x",
+             static_cast<unsigned>(rd()), static_cast<unsigned>(rd()));
+    const std::string tmp = target + suffix;
+
+    #if defined(_WIN32) || defined(_WIN64)
+    std::ofstream out(tmp, std::ofstream::binary | std::ofstream::trunc);
+    if (!out.is_open()) {
+        std::cerr << "Error: Can't open output file " << tmp << std::endl;
+        return 2;
+    }
+    out.write(data, static_cast<std::streamsize>(len));
+    out.close();
+    if (!out) {
+        std::cerr << "Error: Failed to write output file " << tmp << std::endl;
+        std::remove(tmp.c_str());
+        return 2;
+    }
+    std::remove(target.c_str());  // rename won't clobber on Windows
+    #else
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (fd < 0) {
+        std::cerr << "Error: Can't create output file " << tmp << std::endl;
+        return 2;
+    }
+    bool ok = true;
+    for (size_t off = 0; off < len; ) {
+        ssize_t w = write(fd, data + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;  // interrupted by a signal — retry
+            ok = false;
+            break;
+        }
+        if (w == 0) { ok = false; break; }  // not expected for a regular file
+        off += static_cast<size_t>(w);
+    }
+    if (close(fd) != 0) ok = false;
+    if (!ok) {
+        std::cerr << "Error: Failed to write output file " << tmp << std::endl;
+        std::remove(tmp.c_str());
+        return 2;
+    }
+    #endif
+
+    if (std::rename(tmp.c_str(), target.c_str()) != 0) {
+        std::cerr << "Error: Failed to finalize " << target
+                  << "; verified data kept at " << tmp << std::endl;
+        return 2;
+    }
+    return 0;
 }
 
 // Verify the reassembled file against the announced digest and write it out.
@@ -163,39 +198,11 @@ int verifyAndWrite() {
         return 2;
     }
 
-    // Write to a temporary and rename on success, so an interrupted write never
-    // leaves a truncated file under the target name.
-    const std::string tmp = fileName + ".part";
-    std::ofstream output(tmp, std::ofstream::binary | std::ofstream::trunc);
-    if (!output.is_open()) {
-        std::cerr << "Error: Can't open output file " << tmp << std::endl;
+    int wc = writeVerified(fileName, file, file_length);
+    if (wc != 0) {
         delete[] file;
         file = nullptr;
-        return 2;
-    }
-    output.write(file, static_cast<std::streamsize>(file_length));
-    output.close();
-    if (!output) {
-        std::cerr << "Error: Failed to write output file " << tmp << std::endl;
-        std::remove(tmp.c_str());
-        delete[] file;
-        file = nullptr;
-        return 2;
-    }
-    // On POSIX rename() atomically replaces the target, so no pre-remove is
-    // needed. On Windows rename() refuses to overwrite, so drop the target
-    // first (only meaningful with --overwrite, since otherwise it does not exist).
-    #if defined(_WIN32) || defined(_WIN64)
-    std::remove(fileName.c_str());
-    #endif
-    if (std::rename(tmp.c_str(), fileName.c_str()) != 0) {
-        // Keep the verified .part so the transfer is not lost — the RAM copy is
-        // freed below, so this file is the only remaining copy of the data.
-        std::cerr << "Error: Failed to finalize " << fileName
-                  << "; verified data kept at " << tmp << std::endl;
-        delete[] file;
-        file = nullptr;
-        return 2;
+        return wc;
     }
 
     double secs = reporter.elapsed();
@@ -295,10 +302,10 @@ bool announceValid(size_t announced, size_t chunk, int& exit_code) {
         return false;
     }
     // Chunk size must be in the sender's valid --mtu range. The lower bound
-    // matters for safety: parts = file_length / chunk_size, so a forged chunk
-    // size of 1 would make getEmptyParts() build a multi-billion-entry vector
-    // and OOM/crash the receiver from two tiny packets.
-    if (chunk < 64 || chunk > 65507) {
+    // matters for safety: parts = file_length / chunk_size, so a forged tiny
+    // chunk would make getEmptyParts() build a multi-billion-entry vector and
+    // OOM/crash the receiver from two tiny packets.
+    if (chunk < Protocol::MIN_CHUNK || chunk > Protocol::MAX_CHUNK) {
         std::cerr << "Error: Sender announced invalid chunk size " << chunk << std::endl;
         exit_code = 2;
         return false;
@@ -372,7 +379,7 @@ bool handleNewPacket(char*& buf, size_t& bufcap, int64_t length, int& exit_code)
     file_length  = announced;
     chunk_size   = incoming_cs;
     memcpy(expected_hash, buf + 24, 32);
-    announced_name = sanitizeName(std::string(buf + NEW_PACKET_FIXED, name_len));
+    announced_name = Protocol::sanitizeName(std::string(buf + NEW_PACKET_FIXED, name_len));
     if (!fileNameFromCli) fileName = announced_name;
 
     if (!allocateBuffers(buf, bufcap, exit_code)) return false;

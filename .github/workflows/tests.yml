@@ -62,3 +62,32 @@ jobs:
           else
             ctest --test-dir build --output-on-failure
           fi
+
+  # Build with AddressSanitizer + UndefinedBehaviorSanitizer and run the whole
+  # suite, so memory errors and UB in the manual buffer handling are caught in CI.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtest-dev cmake
+
+      - name: Configure (ASan + UBSan)
+        run: |
+          cmake -S . -B build-asan \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+
+      - name: Build
+        run: cmake --build build-asan
+
+      - name: Run tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-asan --output-on-failure
