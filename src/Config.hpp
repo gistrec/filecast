@@ -11,6 +11,7 @@ extern std::string fileName;     // File Name to transfer or receive
 extern bool        fileNameFromCli; // true if the user gave an explicit output name
 extern bool        verbose;      // per-packet logging instead of a progress bar
 extern bool        overwrite;    // allow overwriting an existing output file
+extern bool        resume;       // resume from a .part snapshot if one matches
 
 extern int mtu;     // Max packet size to send and receive
 

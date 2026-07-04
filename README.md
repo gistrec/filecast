@@ -40,6 +40,7 @@ LAN at once, with automatic retransmission of dropped packets.
 - Chunk size negotiated in-band, so mismatched `--mtu` no longer stalls
 - Live progress bar with speed and ETA, and a rate limit in Mbit/s
 - Never clobbers an existing file unless you pass `--overwrite`
+- Resumable: an interrupted receive can pick up where it left off with `--resume`
 - Windows, Linux, and macOS binaries built on every release
 
 ## Quick Start
@@ -96,6 +97,7 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 | `--ttl`       | `15`       | > 0 | Seconds of silence before giving up |
 | `--rate`      | `100`      | > 0 | Target send rate in Mbit/s |
 | `--overwrite` | off        | — | Overwrite an existing output file |
+| `--resume`    | off        | — | Resume an interrupted receive from its `.part` snapshot |
 | `-v, --verbose` | off      | — | Log every packet instead of a progress bar |
 | `--delay-ms`  | —          | ≥ 0 | Advanced: fixed inter-packet pause in ms; overrides `--rate` (`0` blasts at full speed, used by tests) |
 | `-h, --help`  | —          | — | Print help |
@@ -176,11 +178,31 @@ so a receiver ignores traffic from a different (or restarted) sender.
 | `FINISH` | `"FINISH"` · session(4) |
 | `RESEND` | `"RESEND"` · session(4) · part(4) |
 
+## Resuming an Interrupted Transfer
+
+If a receive is interrupted with Ctrl+C, or times out with parts still missing,
+the receiver saves what it has to `<name>.part` (plus a `<name>.part.idx` record
+of which parts arrived). Re-run with `--resume` and it picks up where it left
+off — the transfer is matched by the file's SHA-256, so it works even if the
+sender is restarted (a new session):
+
+```sh
+./filecast receive album.zip --resume
+```
+
+The snapshot is deleted once the file completes and its checksum verifies.
+
 ## Limitations
 
 - The whole file is held in RAM on both sides. The receiver enforces a 4 GiB
   cap on the announced file size; the sender rejects files that do not fit the
   4-byte wire size field.
+- `--resume` recovers from Ctrl+C and timeouts (the snapshot is written on exit);
+  a hard kill (SIGKILL) or power loss mid-transfer can still lose the in-flight
+  progress. The snapshot is the whole buffer written synchronously, so
+  interrupting a multi-gigabyte transfer adds a short exit delay while it flushes.
+  The `.part`/`.part.idx` files use stable, predictable names in the working
+  directory, so run the receiver from a directory only you can write to.
 - No authentication. Any host on the same LAN can send a `NEW_PACKET` and any
   receiver bound to the chosen port will accept it. The SHA-256 check catches
   accidental corruption, not a deliberately crafted stream.
