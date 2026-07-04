@@ -38,11 +38,19 @@ namespace Utils {
     }
 
     /**
-     * Encode an unsigned integer into a big-endian byte sequence.
+     * Encode an unsigned integer into a big-endian byte sequence. Bytes beyond
+     * the width of size_t are written as 0 rather than shifting past the type
+     * width, which is undefined behaviour (count > sizeof(size_t) is used by the
+     * unit tests and would otherwise trip UBSan).
      */
     inline void writeBytesFromNumber(char* buffer, size_t number, int count) {
+        constexpr int bits = static_cast<int>(sizeof(size_t) * 8);
         for (int i = 0; i < count; i++) {
-            buffer[count - i - 1] = static_cast<char>(number >> (i * 8));
+            int shift = i * 8;
+            unsigned char byte = (shift < bits)
+                ? static_cast<unsigned char>(number >> shift)
+                : 0u;
+            buffer[count - i - 1] = static_cast<char>(byte);
         }
     }
 }
