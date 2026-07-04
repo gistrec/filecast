@@ -142,5 +142,54 @@ else
     echo "SKIP: [multicast] not available in this environment"
 fi
 
+# Resume: interrupt a slow receive with SIGINT, then finish it with --resume.
+# Timing-based, so if no snapshot lands (transfer finished or nothing arrived in
+# the window) it SKIPs; but once a snapshot exists, resume must succeed or FAIL.
+run_resume_test() {
+    local src="$WORKDIR/src-resume.bin"
+    local rdir="$WORKDIR/resume"
+    mkdir -p "$rdir"
+    echo "==> [resume] generating 2 MiB file"
+    dd if=/dev/urandom of="$src" bs=1024 count=2048 status=none
+
+    echo "==> [resume] run 1: slow receive, interrupt mid-transfer"
+    ( cd "$rdir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33407 --port 33408 --ttl 10 --resume --overwrite > r1.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$src" --to 127.0.0.1 --bind-port 33408 --port 33407 \
+              --rate 5 --ttl 5 > "$WORKDIR/rsend1.log" 2>&1 &
+    local spid=$!
+    sleep 2
+    kill -INT "$rpid" 2>/dev/null || true; wait "$rpid" 2>/dev/null || true
+    kill "$spid" 2>/dev/null || true; wait "$spid" 2>/dev/null || true
+
+    if [ ! -f "$rdir/out.bin.part.idx" ]; then
+        echo "SKIP: [resume] no snapshot produced in the interrupt window"
+        return 0
+    fi
+
+    echo "==> [resume] run 2: finish with --resume"
+    ( cd "$rdir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33407 --port 33408 --ttl 4 --resume --overwrite > r2.log 2>&1 ) &
+    rpid=$!
+    sleep 1
+    "$BINARY" send "$src" --to 127.0.0.1 --bind-port 33408 --port 33407 \
+              --rate 100 --ttl 3 > "$WORKDIR/rsend2.log" 2>&1
+    wait "$rpid"
+
+    if ! grep -q "Resuming" "$rdir/r2.log"; then
+        echo "FAIL: [resume] second run did not resume from the snapshot"
+        tail -20 "$rdir/r2.log"
+        return 1
+    fi
+    if [ ! -f "$rdir/out.bin" ] || ! cmp -s "$src" "$rdir/out.bin"; then
+        echo "FAIL: [resume] resumed file does not match source"
+        return 1
+    fi
+    echo "PASS: [resume] interrupted transfer resumed and verified"
+}
+run_resume_test
+
 echo
 echo "All E2E tests passed."

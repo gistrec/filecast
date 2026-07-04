@@ -4,6 +4,7 @@ std::string fileName;
 bool        fileNameFromCli = false;
 bool        verbose         = false;
 bool        overwrite       = false;
+bool        resume          = false;
 
 int     mtu     = 0;
 int     ttl     = 0;

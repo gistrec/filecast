@@ -45,6 +45,7 @@ struct CliOptions {
     std::string target;                 // IP for unicast / group for multicast
     bool        verbose   = false;      // per-packet logging instead of a bar
     bool        overwrite = false;      // allow overwriting an existing file
+    bool        resume    = false;      // resume from a .part snapshot
 };
 
 void buildOptions(cxxopts::Options& options) {
@@ -65,6 +66,7 @@ void buildOptions(cxxopts::Options& options) {
         ("delay-ms",  "Override inter-packet pause, ms (advanced, overrides --rate)", cxxopts::value<int>())
         ("v,verbose", "Log every packet instead of a progress bar")
         ("overwrite", "Overwrite an existing output file")
+        ("resume",    "Resume an interrupted transfer from its .part snapshot")
         ("h,help",    "Print help")
         ("version",   "Print version");
 
@@ -163,6 +165,7 @@ bool collectOptions(const cxxopts::ParseResult& result, bool is_sender, CliOptio
 
     opt.verbose   = (result.count("verbose") != 0);
     opt.overwrite = (result.count("overwrite") != 0);
+    opt.resume    = (result.count("resume") != 0);
 
     // send needs an explicit file; receive may take the name from the sender.
     const bool has_file = (result.count("file") != 0);
@@ -361,6 +364,7 @@ int main(int argc, char* argv[]) {
     fileNameFromCli = opt.file_from_cli;
     verbose         = opt.verbose;
     overwrite       = opt.overwrite;
+    resume          = opt.resume;
 
     int rc = setupSocket(opt);
     if (rc != 0) {

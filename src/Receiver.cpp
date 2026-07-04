@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cctype>
 #include <cerrno>
+#include <csignal>
 #include <string>
 #include <algorithm>
 #include <random>
@@ -21,12 +22,26 @@
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>   // open, O_EXCL, O_NOFOLLOW
+#include <unistd.h>  // read, write, close
 #endif
 
 using namespace std::chrono_literals;
 
 
 namespace Receiver {
+
+// Set by SIGINT/SIGTERM so the receive loop can snapshot progress and exit
+// cleanly (writing a file from a signal handler is not async-signal-safe).
+volatile sig_atomic_t g_interrupted = 0;
+
+extern "C" void onSignal(int) { g_interrupted = 1; }
+
+void installSignalHandlers() {
+    std::signal(SIGINT, onSignal);
+#ifdef SIGTERM
+    std::signal(SIGTERM, onSignal);
+#endif
+}
 
 // Hard upper bound on the file size announced by a sender. We allocate the file
 // in RAM, so anything larger than this would either fail or cause OOM. Adjust
@@ -175,6 +190,172 @@ int writeVerified(const std::string& target, const char* data, size_t len) {
     return 0;
 }
 
+// Write len bytes to `path` (stable name, truncating). On POSIX O_NOFOLLOW
+// keeps a planted symlink from being followed. Returns false on I/O error.
+bool writeRawFile(const std::string& path, const char* data, size_t len) {
+    #if defined(_WIN32) || defined(_WIN64)
+    std::ofstream out(path, std::ofstream::binary | std::ofstream::trunc);
+    if (!out.is_open()) return false;
+    out.write(data, static_cast<std::streamsize>(len));
+    out.close();
+    return static_cast<bool>(out);
+    #else
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (fd < 0) return false;
+    bool ok = true;
+    for (size_t off = 0; off < len; ) {
+        ssize_t w = write(fd, data + off, len - off);
+        if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+        if (w == 0) { ok = false; break; }
+        off += static_cast<size_t>(w);
+    }
+    if (close(fd) != 0) ok = false;
+    return ok;
+    #endif
+}
+
+// Read up to `max` bytes of `path` into `out`, reporting the count in `got`.
+// On POSIX O_NOFOLLOW refuses to follow a symlink planted at that path, matching
+// the write side (writeRawFile/writeVerified) — otherwise a hostile symlink could
+// make resume slurp an arbitrary file the receiver can read into the buffer that
+// saveSnapshot later writes back out. Returns false on open/read error.
+bool readRawFile(const std::string& path, char* out, size_t max, size_t& got) {
+    #if defined(_WIN32) || defined(_WIN64)
+    std::ifstream in(path, std::ifstream::binary);
+    if (!in.is_open()) return false;
+    in.read(out, static_cast<std::streamsize>(max));
+    got = static_cast<size_t>(in.gcount());
+    return true;
+    #else
+    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return false;
+    got = 0;
+    while (got < max) {
+        ssize_t r = read(fd, out + got, max - got);
+        if (r < 0) { if (errno == EINTR) continue; close(fd); return false; }
+        if (r == 0) break;  // EOF before max — caller checks got
+        got += static_cast<size_t>(r);
+    }
+    close(fd);
+    return true;
+    #endif
+}
+
+// snapshot header: "FCIDX1"+NUL(7) + sha256(32) + file_length(8) + chunk(4).
+constexpr size_t SNAPSHOT_HEADER = 51;
+
+// Persist the partial buffer to <name>.part and a bitmap of received parts to
+// <name>.part.idx, so a later --resume run keyed on the file's SHA-256 can pick
+// up where this one left off. Best-effort: a failure only means no resume.
+// Gated on --resume so a plain receive never leaves surprise .part files behind
+// (nor pays the synchronous whole-buffer write) when interrupted.
+void saveSnapshot() {
+    if (!resume || file == nullptr || !have_session) return;
+    const std::string partPath = fileName + ".part";
+    if (!writeRawFile(partPath, file, file_length)) {
+        std::cerr << "Warning: could not save resume snapshot to " << partPath << std::endl;
+        return;
+    }
+    size_t total = totalParts();
+    std::vector<char> idx(SNAPSHOT_HEADER + (total + 7) / 8, 0);
+    memcpy(idx.data(), "FCIDX1", 7);  // 6 chars + trailing NUL
+    memcpy(idx.data() + 7, expected_hash, 32);
+    Utils::writeBytesFromNumber(idx.data() + 39, file_length, 8);
+    Utils::writeBytesFromNumber(idx.data() + 47, chunk_size,  4);
+    for (size_t p : parts) idx[SNAPSHOT_HEADER + p / 8] |= static_cast<char>(1 << (p % 8));
+    writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
+}
+
+// Remove the snapshot once the transfer has completed and been written out.
+void discardSnapshot() {
+    std::remove((fileName + ".part").c_str());
+    std::remove((fileName + ".part.idx").c_str());
+}
+
+// Try to load a matching snapshot into `file`/`parts`. Only reuses data whose
+// idx records the same SHA-256, size and chunk as the current transfer. Returns
+// true on a successful resume (file/parts/received_bytes are populated).
+bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
+    size_t total  = Protocol::totalParts(announced, chunk);
+    size_t bmSize = (total + 7) / 8;
+
+    // Header + bitmap are a fixed size for this transfer, so read them in one go
+    // and require an exact length — a torn/truncated .idx is rejected outright.
+    std::vector<char> idx(SNAPSHOT_HEADER + bmSize);
+    size_t got = 0;
+    if (!readRawFile(fileName + ".part.idx", idx.data(), idx.size(), got)) return false;
+    if (got != idx.size()) return false;
+    if (memcmp(idx.data(), "FCIDX1", 7) != 0) return false;
+    if (memcmp(idx.data() + 7, hash, 32) != 0) return false;
+    if (Utils::getNumberFromBytes(idx.data() + 39, 8) != announced) return false;
+    if (Utils::getNumberFromBytes(idx.data() + 47, 4) != chunk) return false;
+    const char* bm = idx.data() + SNAPSHOT_HEADER;
+
+    char* buf = new (std::nothrow) char[announced];
+    if (!buf) return false;
+    got = 0;
+    if (!readRawFile(fileName + ".part", buf, announced, got) || got != announced) {
+        delete[] buf;
+        return false;
+    }
+
+    delete[] file;
+    file = buf;
+    parts.clear();
+    received_bytes = 0;
+    for (size_t p = 0; p < total; ++p) {
+        if (bm[p / 8] & (1 << (p % 8))) {
+            parts.insert(p);
+            received_bytes += Protocol::expectedPartSize(p, announced, chunk);
+        }
+    }
+    return true;
+}
+
+// Snapshot the partial file and clean up after Ctrl+C/SIGTERM. Returns 130.
+int onInterrupt(char* buffer) {
+    reporter.finish();
+    saveSnapshot();
+    if (resume && file != nullptr) {
+        std::cerr << "\nInterrupted; progress saved (retry with --resume)" << std::endl;
+    } else {
+        std::cerr << "\nInterrupted" << std::endl;
+    }
+    delete[] buffer;
+    delete[] file;
+    file = nullptr;
+    return 130;
+}
+
+// ttl ran out before the sender ever sent FINISH (it crashed, was killed, or the
+// network dropped mid-send). Persist any partial progress — a no-op without
+// --resume or if nothing was received — so a later --resume can finish it, then
+// clean up. Returns 2. Mirrors the checkParts timeout path so both timeouts save.
+int onTimeout(char* buffer) {
+    reporter.finish();
+    saveSnapshot();
+    if (resume && file != nullptr) {
+        std::cerr << "Transfer timed out; progress saved (retry with --resume)" << std::endl;
+    }
+    delete[] buffer;
+    delete[] file;
+    file = nullptr;
+    return 2;
+}
+
+// ttl expired during recovery with parts still missing. Persist + report. The
+// caller has already freed its receive buffer. Returns 2.
+int onRecoveryTimeout(size_t missing) {
+    reporter.finish();  // clear the bar before the error line
+    saveSnapshot();     // keep progress so a later --resume can finish it
+    std::cerr << "Error: Transfer timed out with " << missing << " part(s) missing";
+    if (resume) std::cerr << "; progress saved (retry with --resume)";
+    std::cerr << std::endl;
+    delete[] file;
+    file = nullptr;
+    return 2;
+}
+
 // Verify the reassembled file against the announced digest and write it out.
 // Returns a process exit code.
 int verifyAndWrite() {
@@ -184,6 +365,10 @@ int verifyAndWrite() {
     Sha256::hash(file, file_length, got);
     if (memcmp(got, expected_hash, 32) != 0) {
         std::cerr << "Error: checksum mismatch — received file is corrupt" << std::endl;
+        // A resumed snapshot whose bytes are corrupt (e.g. torn write) would fail
+        // here forever; drop it so the next --resume starts clean instead of
+        // reloading the same poison.
+        if (resume) discardSnapshot();
         delete[] file;
         file = nullptr;
         return 2;
@@ -204,6 +389,7 @@ int verifyAndWrite() {
         file = nullptr;
         return wc;
     }
+    discardSnapshot();  // transfer complete — the .part snapshot is no longer needed
 
     double secs = reporter.elapsed();
     double rate = secs > 0 ? file_length / secs : 0;
@@ -237,6 +423,7 @@ int checkParts() {
     std::vector<size_t> emptyParts = getEmptyParts();
 
     while (ttl && !emptyParts.empty()) {
+        if (g_interrupted) return onInterrupt(buffer);
         for (auto index : emptyParts) {
             snprintf(buffer, 7, "RESEND");
             Utils::writeBytesFromNumber(buffer +  6, session_id, 4);
@@ -277,13 +464,7 @@ int checkParts() {
 
     delete[] buffer;
 
-    if (!emptyParts.empty()) {
-        reporter.finish();  // clear the bar before the error line
-        std::cerr << "Error: Transfer timed out, file is incomplete" << std::endl;
-        delete[] file;
-        file = nullptr;
-        return 2;
-    }
+    if (!emptyParts.empty()) return onRecoveryTimeout(emptyParts.size());
 
     return verifyAndWrite();
 }
@@ -313,9 +494,8 @@ bool announceValid(size_t announced, size_t chunk, int& exit_code) {
     return true;
 }
 
-// Grow the receive buffer to hold a full chunk and (re)allocate the file buffer
-// for a new transfer. Sets exit_code and returns false on allocation failure.
-bool allocateBuffers(char*& buf, size_t& bufcap, int& exit_code) {
+// Grow the receive buffer so it can hold a full chunk for this transfer.
+bool growRecvBuffer(char*& buf, size_t& bufcap, int& exit_code) {
     size_t need = chunk_size + TRANSFER_HEADER;
     if (need > bufcap) {
         delete[] buf;
@@ -327,7 +507,11 @@ bool allocateBuffers(char*& buf, size_t& bufcap, int& exit_code) {
             return false;
         }
     }
+    return true;
+}
 
+// Allocate a fresh (empty) file buffer for a new transfer.
+bool allocateFileFresh(int& exit_code) {
     delete[] file;
     parts.clear();
     received_bytes = 0;
@@ -337,6 +521,16 @@ bool allocateBuffers(char*& buf, size_t& bufcap, int& exit_code) {
         exit_code = 1;
         return false;
     }
+    return true;
+}
+
+// Grow the receive buffer and set up the file buffer: resume from a matching
+// snapshot when --resume is given, otherwise start fresh. Sets resumed.
+bool prepareStorage(char*& buf, size_t& bufcap, size_t announced, size_t chunk,
+                    bool& resumed, int& exit_code) {
+    if (!growRecvBuffer(buf, bufcap, exit_code)) return false;
+    resumed = resume && tryResume(announced, chunk, expected_hash);
+    if (!resumed && !allocateFileFresh(exit_code)) return false;
     return true;
 }
 
@@ -382,14 +576,20 @@ bool handleNewPacket(char*& buf, size_t& bufcap, int64_t length, int& exit_code)
     announced_name = Protocol::sanitizeName(std::string(buf + NEW_PACKET_FIXED, name_len));
     if (!fileNameFromCli) fileName = announced_name;
 
-    if (!allocateBuffers(buf, bufcap, exit_code)) return false;
+    bool resumed = false;
+    if (!prepareStorage(buf, bufcap, announced, incoming_cs, resumed, exit_code)) return false;
 
     if (verbose) {
         std::cout << "Receive information about new file: " << fileName
                   << " (" << file_length << " bytes)" << std::endl;
         std::cout << "Number of parts: " << totalParts() << std::endl;
     }
+    if (resumed) {
+        std::cout << "Resuming " << fileName << ": " << parts.size()
+                  << "/" << totalParts() << " parts already present" << std::endl;
+    }
     reporter.start("Receiving " + fileName, file_length, verbose);
+    reporter.update(received_bytes);
     return true;
 }
 
@@ -405,6 +605,21 @@ void handleFinish(const char* buf, int64_t length, bool& finish) {
     }
 }
 
+// Dispatch one received datagram to the right handler. Returns -1 to keep
+// receiving; any value >= 0 is a process exit code the caller should return
+// after freeing its buffers. buf may be reallocated to fit the announced chunk.
+int dispatchPacket(char*& buf, size_t& bufcap, int64_t length, bool& finish) {
+    if (strncmp(buf, "NEW_PACKET", 10) == 0) {
+        int exit_code = 0;
+        if (!handleNewPacket(buf, bufcap, length, exit_code)) return exit_code;
+    } else if (strncmp(buf, "TRANSFER", 8) == 0 && file != nullptr) {
+        if (handleTransfer(buf, length)) ttl = ttl_max;
+    } else if (strncmp(buf, "FINISH", 6) == 0) {
+        handleFinish(buf, length, finish);
+    }
+    return -1;
+}
+
 // Returns a process exit code: 0 on success, non-zero on failure.
 int run() {
     bool finish = false; // Sender finished transferring
@@ -416,11 +631,13 @@ int run() {
         return 1;
     }
 
+    installSignalHandlers();
     if (!verbose) {
         std::cerr << "Waiting for a sender... (Ctrl+C to cancel)" << std::endl;
     }
 
     while (ttl > 0) {
+        if (g_interrupted) return onInterrupt(buffer);
         // Sender finished transferring — move to the recovery phase (or bail if
         // we joined too late to ever have received NEW_PACKET).
         if (finish) {
@@ -449,26 +666,21 @@ int run() {
             continue;
         }
 
-        if (strncmp(buffer, "NEW_PACKET", 10) == 0) {
-            int exit_code = 0;
-            if (!handleNewPacket(buffer, bufcap, static_cast<int64_t>(length), exit_code)) {
-                delete[] buffer;
-                delete[] file;
-                file = nullptr;
-                return exit_code;
-            }
-        } else if (strncmp(buffer, "TRANSFER", 8) == 0 && file != nullptr) {
-            if (handleTransfer(buffer, static_cast<int64_t>(length))) ttl = ttl_max;
-        } else if (strncmp(buffer, "FINISH", 6) == 0) {
-            handleFinish(buffer, static_cast<int64_t>(length), finish);
+        int code = dispatchPacket(buffer, bufcap, static_cast<int64_t>(length), finish);
+        if (code >= 0) {
+            delete[] buffer;
+            delete[] file;
+            file = nullptr;
+            return code;
         }
     }
+    // A Ctrl+C that landed exactly as ttl hit 0 skips the top-of-loop check
+    // (recvfrom's ttl-- dropped ttl to 0 and the while guard exited first), so
+    // re-check here to still take the interrupt path (snapshot + exit 130).
+    if (g_interrupted) return onInterrupt(buffer);
+
     // ttl exhausted before FINISH: the transfer did not complete.
-    reporter.finish();  // clear the bar if one was drawn
-    delete[] buffer;
-    delete[] file;
-    file = nullptr;
-    return 2;
+    return onTimeout(buffer);
 }
 
 } //namespace Receiver
