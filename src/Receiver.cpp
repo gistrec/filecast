@@ -132,37 +132,65 @@ bool fileExists(const std::string& path) {
     return f.good();
 }
 
-// Write len bytes to a randomly-named temp beside `target`, then rename onto it.
-// The random suffix keeps a hostile sender from predicting the temp path, and on
-// POSIX O_EXCL|O_NOFOLLOW means a symlink planted at that path is never followed.
-// Returns a process exit code; on rename failure the verified temp is kept.
-int writeVerified(const std::string& target, const char* data, size_t len) {
-    std::random_device rd;
-    char suffix[24];
-    snprintf(suffix, sizeof(suffix), ".part.%08x%08x",
-             static_cast<unsigned>(rd()), static_cast<unsigned>(rd()));
-    const std::string tmp = target + suffix;
+#if !defined(_WIN32) && !defined(_WIN64)
+// Flush `fd` to stable storage, retrying on EINTR. On macOS a plain fsync only
+// pushes data to the drive — it does NOT force the drive to write its cache to
+// permanent media (Apple's fsync(2)); F_FULLFSYNC does, so we prefer it there and
+// fall back to fsync when the filesystem doesn't support it (e.g. some network
+// mounts). Returns 0 on success, -1 on error.
+int durableSync(int fd) {
+#if defined(__APPLE__)
+    for (;;) {
+        if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
+        if (errno == EINTR) continue;
+        if (errno == ENOTSUP || errno == EINVAL || errno == ENOSYS) break;  // -> fsync
+        return -1;
+    }
+#endif
+    for (;;) {
+        if (fsync(fd) == 0) return 0;
+        if (errno == EINTR) continue;  // interrupted by a signal — retry
+        return -1;
+    }
+}
 
+// Best-effort: flush the directory holding `path` so a completed rename survives
+// a crash/power loss — on POSIX a rename is durable only once the parent
+// directory entry itself is flushed.
+void syncParentDir(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    std::string dir = (slash == std::string::npos) ? std::string(".")
+                    : (slash == 0 ? std::string("/") : path.substr(0, slash));
+    int dfd = open(dir.c_str(), O_RDONLY);
+    if (dfd < 0) return;
+    durableSync(dfd);
+    close(dfd);
+}
+#endif
+
+// Write len bytes to a fresh temp file `tmp`, flushing the data to stable storage
+// before returning so the reassembled output survives an OS crash or power loss.
+// On POSIX O_EXCL|O_NOFOLLOW means a symlink or pre-existing file planted at that
+// path is rejected rather than followed/overwritten. Returns false on I/O error.
+bool writeTempFile(const std::string& tmp, const char* data, size_t len) {
     #if defined(_WIN32) || defined(_WIN64)
     std::ofstream out(tmp, std::ofstream::binary | std::ofstream::trunc);
-    if (!out.is_open()) {
-        std::cerr << "Error: Can't open output file " << tmp << std::endl;
-        return 2;
-    }
+    if (!out.is_open()) return false;
     out.write(data, static_cast<std::streamsize>(len));
     out.close();
-    if (!out) {
-        std::cerr << "Error: Failed to write output file " << tmp << std::endl;
-        std::remove(tmp.c_str());
-        return 2;
-    }
-    std::remove(target.c_str());  // rename won't clobber on Windows
+    if (!out) return false;
+    // std::ofstream::close only reaches the OS cache; force the payload to disk
+    // before the move so a power loss can't leave a torn/empty output (MoveFileEx
+    // WRITE_THROUGH flushes only cross-volume copies, not a same-volume rename).
+    HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BOOL flushed = FlushFileBuffers(h);
+    CloseHandle(h);
+    return flushed != 0;
     #else
     int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
-    if (fd < 0) {
-        std::cerr << "Error: Can't create output file " << tmp << std::endl;
-        return 2;
-    }
+    if (fd < 0) return false;
     bool ok = true;
     for (size_t off = 0; off < len; ) {
         ssize_t w = write(fd, data + off, len - off);
@@ -171,18 +199,52 @@ int writeVerified(const std::string& target, const char* data, size_t len) {
             ok = false;
             break;
         }
-        if (w == 0) { ok = false; break; }  // not expected for a regular file
+        if (w == 0) {  // not expected for a regular file
+            ok = false;
+            break;
+        }
         off += static_cast<size_t>(w);
     }
+    if (ok && durableSync(fd) != 0) ok = false;  // flush data to disk before rename
     if (close(fd) != 0) ok = false;
-    if (!ok) {
+    return ok;
+    #endif
+}
+
+// Atomically move `tmp` onto `target`, replacing any existing file. The payload
+// was already flushed by writeTempFile; here we make the rename itself durable.
+// On Windows MoveFileEx replaces atomically (a plain rename can't clobber) and
+// WRITE_THROUGH flushes the operation; on POSIX rename is atomic and we flush the
+// directory so the rename survives a crash. Returns false on failure, leaving the
+// verified temp in place.
+bool finalizeReplace(const std::string& tmp, const std::string& target) {
+    #if defined(_WIN32) || defined(_WIN64)
+    return MoveFileExA(tmp.c_str(), target.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    #else
+    if (std::rename(tmp.c_str(), target.c_str()) != 0) return false;
+    syncParentDir(target);
+    return true;
+    #endif
+}
+
+// Write len bytes to a randomly-named temp beside `target`, then atomically move
+// it onto `target`. The random suffix keeps a hostile sender from predicting the
+// temp path. Returns a process exit code; on finalize failure the verified temp
+// is kept so no data is lost.
+int writeVerified(const std::string& target, const char* data, size_t len) {
+    std::random_device rd;
+    char suffix[24];
+    snprintf(suffix, sizeof(suffix), ".part.%08x%08x",
+             static_cast<unsigned>(rd()), static_cast<unsigned>(rd()));
+    const std::string tmp = target + suffix;
+
+    if (!writeTempFile(tmp, data, len)) {
         std::cerr << "Error: Failed to write output file " << tmp << std::endl;
         std::remove(tmp.c_str());
         return 2;
     }
-    #endif
-
-    if (std::rename(tmp.c_str(), target.c_str()) != 0) {
+    if (!finalizeReplace(tmp, target)) {
         std::cerr << "Error: Failed to finalize " << target
                   << "; verified data kept at " << tmp << std::endl;
         return 2;
