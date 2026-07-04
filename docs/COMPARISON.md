@@ -7,7 +7,7 @@ many LAN machines with the least setup?**
 
 Facts were checked against each project's own documentation and source in
 July 2026 — versions and features move, so if you spot an error please
-[open an issue](https://github.com/gistrec/Filecast/issues).
+[open an issue](https://github.com/gistrec/filecast/issues).
 
 |  | filecast | [udpcast](https://www.udpcast.linux.lu/) | [UFTP](https://uftp-multicast.sourceforge.net/) | [croc](https://github.com/schollz/croc) | [LocalSend](https://localsend.org/) | [magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) |
 | --- | --- | --- | --- | --- | --- | --- |

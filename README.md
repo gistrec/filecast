@@ -8,7 +8,7 @@ One sender, any number of receivers, no internet required.
 <p>
     <a href="https://github.com/gistrec/filecast/actions/workflows/tests.yml">
         <img src="https://github.com/gistrec/filecast/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
-    <a href="https://app.codacy.com/gh/gistrec/Filecast/dashboard">
+    <a href="https://app.codacy.com/gh/gistrec/filecast/dashboard">
         <img src="https://img.shields.io/codacy/grade/4c8169bcab3a4df18baad4e5658ec8ce" alt="Code quality"></a>
     <a href="https://github.com/gistrec/filecast/releases">
         <img src="https://img.shields.io/github/v/release/gistrec/filecast" alt="Release"></a>
@@ -74,7 +74,7 @@ filecast send photo.jpg --to 192.168.1.50
 **One-liner** (Linux, macOS):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gistrec/Filecast/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gistrec/filecast/master/install.sh | sh
 ```
 
 The script picks the prebuilt binary for your platform from the latest
@@ -84,7 +84,7 @@ SHA-256 against the release's `checksums.txt`, and installs it to
 you own:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gistrec/Filecast/master/install.sh | BIN_DIR="$HOME/bin" sh
+curl -fsSL https://raw.githubusercontent.com/gistrec/filecast/master/install.sh | BIN_DIR="$HOME/bin" sh
 ```
 
 **Manual**: download a binary from the
