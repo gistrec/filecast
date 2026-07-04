@@ -142,6 +142,34 @@ else
     echo "SKIP: [multicast] not available in this environment"
 fi
 
+# --iface guard rails: the flag only applies to multicast and must be a valid
+# IPv4. These are pure argument checks (no sockets), so they run everywhere and
+# pin the validation added alongside --iface. Assert the *specific* rejection
+# message rather than just a non-zero exit — otherwise, on a host without
+# multicast routing, a broken validation could fall through to a failed group
+# join (also exit 1) and pass for the wrong reason.
+run_iface_validation() {
+    local f="$WORKDIR/iface-src.bin"
+    echo "iface-test" > "$f"
+    local out=0 err
+
+    err="$("$BINARY" send "$f" --iface 10.0.0.1 2>&1 >/dev/null || true)"
+    grep -q "only applies to --multicast" <<<"$err" || {
+        echo "FAIL: [iface] --iface without --multicast not rejected: $err"; out=1; }
+
+    err="$("$BINARY" send "$f" --to 127.0.0.1 --iface 10.0.0.1 2>&1 >/dev/null || true)"
+    grep -q "only applies to --multicast" <<<"$err" || {
+        echo "FAIL: [iface] --iface with unicast --to not rejected: $err"; out=1; }
+
+    err="$("$BINARY" send "$f" --multicast 239.1.2.3 --iface not-an-ip 2>&1 >/dev/null || true)"
+    grep -q -- "--iface must be a valid IPv4 address" <<<"$err" || {
+        echo "FAIL: [iface] invalid --iface IPv4 not rejected: $err"; out=1; }
+
+    [ "$out" -eq 0 ] && echo "PASS: [iface] --iface guard rails reject misuse"
+    return "$out"
+}
+run_iface_validation
+
 # Resume: interrupt a slow receive with SIGINT, then finish it with --resume.
 # Timing-based, so if no snapshot lands (transfer finished or nothing arrived in
 # the window) it SKIPs; but once a snapshot exists, resume must succeed or FAIL.

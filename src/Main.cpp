@@ -43,6 +43,9 @@ struct CliOptions {
     bool        file_from_cli = false;  // true if the user named the file
     SendMode    mode      = SendMode::Broadcast;
     std::string target;                 // IP for unicast / group for multicast
+    bool        has_iface = false;      // --iface given (multicast interface pinned)
+    std::string iface;                  // its original string, for messages
+    struct in_addr iface_addr{};        // parsed --iface (IP_MULTICAST_IF / imr_interface)
     bool        verbose   = false;      // per-packet logging instead of a bar
     bool        overwrite = false;      // allow overwriting an existing file
     bool        resume    = false;      // resume from a .part snapshot
@@ -58,6 +61,7 @@ void buildOptions(cxxopts::Options& options) {
         ("f,file",    "File to send, or where to save it when receiving", cxxopts::value<std::string>())
         ("to",        "Send to this IPv4 address instead of LAN broadcast", cxxopts::value<std::string>())
         ("multicast", "Use this IPv4 multicast group (224.0.0.0-239.255.255.255)", cxxopts::value<std::string>())
+        ("iface",     "Multicast interface IPv4 address (which NIC to use; --multicast only)", cxxopts::value<std::string>())
         ("p,port",    "Destination UDP port",                 cxxopts::value<int>()->default_value("33333"))
         ("bind-port", "Local UDP port to bind on",            cxxopts::value<int>()->default_value("33333"))
         ("mtu",       "Max packet size in bytes",             cxxopts::value<int>()->default_value("1500"))
@@ -139,6 +143,40 @@ bool validateNumericFlags(const CliOptions& opt) {
     return true;
 }
 
+// Resolve the destination mode (broadcast / --to unicast / --multicast group)
+// and the optional --iface into opt. Prints and returns false on any problem.
+bool collectDestination(const cxxopts::ParseResult& result, CliOptions& opt) {
+    if (result.count("to") && result.count("multicast")) {
+        std::cerr << "Error: --to and --multicast are mutually exclusive" << std::endl;
+        return false;
+    }
+    if (result.count("multicast")) {
+        opt.mode = SendMode::Multicast;
+        opt.target = result["multicast"].as<std::string>();
+    } else if (result.count("to")) {
+        opt.mode = SendMode::Unicast;
+        opt.target = result["to"].as<std::string>();
+    } else {
+        opt.mode = SendMode::Broadcast;
+    }
+
+    // --iface pins the NIC used for multicast (send + join). It has no meaning
+    // for broadcast/unicast, so reject it there rather than silently ignore it.
+    if (result.count("iface")) {
+        if (opt.mode != SendMode::Multicast) {
+            std::cerr << "Error: --iface only applies to --multicast" << std::endl;
+            return false;
+        }
+        opt.iface = result["iface"].as<std::string>();
+        if (inet_pton(AF_INET, opt.iface.c_str(), &opt.iface_addr) != 1) {
+            std::cerr << "Error: --iface must be a valid IPv4 address" << std::endl;
+            return false;
+        }
+        opt.has_iface = true;
+    }
+    return true;
+}
+
 // Fill a CliOptions from the parsed result and validate it. Prints and returns
 // false on any problem.
 bool collectOptions(const cxxopts::ParseResult& result, bool is_sender, CliOptions& opt) {
@@ -176,21 +214,7 @@ bool collectOptions(const cxxopts::ParseResult& result, bool is_sender, CliOptio
     opt.file          = has_file ? result["file"].as<std::string>() : std::string();
     opt.file_from_cli = has_file;
 
-    // Destination mode: default broadcast, --to <ip> unicast, --multicast <group>.
-    if (result.count("to") && result.count("multicast")) {
-        std::cerr << "Error: --to and --multicast are mutually exclusive" << std::endl;
-        return false;
-    }
-    if (result.count("multicast")) {
-        opt.mode = SendMode::Multicast;
-        opt.target = result["multicast"].as<std::string>();
-    } else if (result.count("to")) {
-        opt.mode = SendMode::Unicast;
-        opt.target = result["to"].as<std::string>();
-    } else {
-        opt.mode = SendMode::Broadcast;
-    }
-    return true;
+    return collectDestination(result, opt);
 }
 
 // Fill broadcast_address with the destination and apply mode-specific options
@@ -226,6 +250,19 @@ int configureDestination(const CliOptions& opt) {
             std::cerr << "Error: --multicast must be in 224.0.0.0-239.255.255.255" << std::endl;
             return 1;
         }
+        // Pin outgoing multicast (the sender's TRANSFERs, the receiver's RESENDs)
+        // to the requested NIC. Without this the kernel picks the egress
+        // interface, which on a multi-homed host may be the wrong one.
+        if (opt.has_iface &&
+            setsockopt(_socket, IPPROTO_IP, IP_MULTICAST_IF,
+                       reinterpret_cast<const char*>(&opt.iface_addr),
+                       sizeof(opt.iface_addr)) != 0) {
+            std::cerr << "Error: Can't set multicast interface " << opt.iface << std::endl;
+            return 1;
+        }
+        if (opt.has_iface && verbose) {
+            std::cout << "Ok: Multicast interface " << opt.iface << std::endl;
+        }
     }
     return 0;
 }
@@ -236,7 +273,8 @@ int joinMulticast(const CliOptions& opt) {
     if (opt.mode != SendMode::Multicast) return 0;
     struct ip_mreq mreq;
     mreq.imr_multiaddr = broadcast_address.sin_addr;
-    mreq.imr_interface.s_addr = INADDR_ANY;
+    // Join on the requested NIC, or let the kernel choose (INADDR_ANY).
+    mreq.imr_interface.s_addr = opt.has_iface ? opt.iface_addr.s_addr : INADDR_ANY;
     if (setsockopt(_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                    reinterpret_cast<const char*>(&mreq), sizeof(mreq)) != 0) {
         std::cerr << "Error: Can't join multicast group " << opt.target << std::endl;

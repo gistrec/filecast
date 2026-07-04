@@ -91,6 +91,7 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 | `<file>` (positional) | — (send) / name from sender (receive) | — | File to send, or where to save it. `-f, --file` is an alias |
 | `--to`        | broadcast  | IPv4 | Send to one host instead of LAN broadcast |
 | `--multicast` | broadcast  | IPv4 multicast | Use an IP multicast group (224.0.0.0-239.255.255.255) instead of broadcast |
+| `--iface`     | system-chosen | IPv4 | Multicast interface — the local NIC's IPv4 to send/receive the group on (`--multicast` only) |
 | `-p, --port`  | `33333`    | 1..65535 | Destination port for outgoing packets |
 | `--bind-port` | `33333`    | 1..65535 | Local port to bind on |
 | `--mtu`       | `1500`     | 64..65507 | Max packet size in bytes |
@@ -135,6 +136,14 @@ only to subscribers). Sender and every receiver use the same group:
 
 # On every receiver host (same group)
 ./filecast receive album.zip --multicast 239.1.2.3
+```
+
+On a multi-homed host (several NICs), pin the group to a specific interface by
+its local IPv4 so the kernel doesn't pick the wrong one:
+
+```sh
+./filecast send album.zip --multicast 239.1.2.3 --iface 192.168.1.10
+./filecast receive album.zip --multicast 239.1.2.3 --iface 192.168.1.10
 ```
 
 **Loopback test** (sender and receiver on the same host — useful for
