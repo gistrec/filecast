@@ -77,9 +77,14 @@ jobs:
 
       - name: Asset names match release.yml
         run: |
+          # install.sh builds the Linux names from a template; the mock round
+          # trip below exercises the real filecast-linux-x86_64 construction.
+          for pat in 'filecast-linux-${arch}' 'filecast-macos-universal' \
+                     'filecast-windows-x86_64.exe'; do
+            grep -qF -- "$pat" install.sh || { echo "install.sh misses $pat"; exit 1; }
+          done
           for n in filecast-linux-x86_64 filecast-linux-arm64 \
                    filecast-macos-universal filecast-windows-x86_64.exe; do
-            grep -q -- "$n" install.sh || { echo "install.sh misses $n"; exit 1; }
             grep -q "asset_name: $n" .github/workflows/release.yml \
               || { echo "release.yml misses $n"; exit 1; }
           done
