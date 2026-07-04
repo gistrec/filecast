@@ -205,8 +205,15 @@ bool writeRawFile(const std::string& path, const char* data, size_t len) {
     bool ok = true;
     for (size_t off = 0; off < len; ) {
         ssize_t w = write(fd, data + off, len - off);
-        if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
-        if (w == 0) { ok = false; break; }
+        if (w < 0) {
+            if (errno == EINTR) continue;  // interrupted by a signal — retry
+            ok = false;
+            break;
+        }
+        if (w == 0) {  // not expected for a regular file
+            ok = false;
+            break;
+        }
         off += static_cast<size_t>(w);
     }
     if (close(fd) != 0) ok = false;
@@ -232,7 +239,11 @@ bool readRawFile(const std::string& path, char* out, size_t max, size_t& got) {
     got = 0;
     while (got < max) {
         ssize_t r = read(fd, out + got, max - got);
-        if (r < 0) { if (errno == EINTR) continue; close(fd); return false; }
+        if (r < 0) {
+            if (errno == EINTR) continue;  // interrupted by a signal — retry
+            close(fd);
+            return false;
+        }
         if (r == 0) break;  // EOF before max — caller checks got
         got += static_cast<size_t>(r);
     }
