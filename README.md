@@ -32,7 +32,8 @@ LAN at once, with automatic retransmission of dropped packets.
 ## Features
 
 - Broadcast to every host on a LAN with a single transmission
-- Unicast mode for point-to-point transfer
+- Unicast mode for point-to-point transfer, and IP multicast for one-to-many
+  without flooding the whole VLAN
 - Automatic retransmission of lost packets
 - End-to-end SHA-256 integrity check — a corrupted file is rejected, not saved
 - File name travels with the transfer, so `receive` needs no arguments
@@ -88,6 +89,7 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 | --------- | ------- | ----- | ----------- |
 | `<file>` (positional) | — (send) / name from sender (receive) | — | File to send, or where to save it. `-f, --file` is an alias |
 | `--to`        | broadcast  | IPv4 | Send to one host instead of LAN broadcast |
+| `--multicast` | broadcast  | IPv4 multicast | Use an IP multicast group (224.0.0.0-239.255.255.255) instead of broadcast |
 | `-p, --port`  | `33333`    | 1..65535 | Destination port for outgoing packets |
 | `--bind-port` | `33333`    | 1..65535 | Local port to bind on |
 | `--mtu`       | `1500`     | 64..65507 | Max packet size in bytes |
@@ -119,6 +121,18 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 
 # On 10.0.0.42 (receiver broadcasts its RESENDs by default)
 ./filecast receive album.zip
+```
+
+**IP multicast** (one-to-many without flooding every host on the VLAN — NICs of
+non-members drop the traffic in hardware and IGMP-snooping switches forward it
+only to subscribers). Sender and every receiver use the same group:
+
+```sh
+# On the sender host
+./filecast send album.zip --multicast 239.1.2.3
+
+# On every receiver host (same group)
+./filecast receive album.zip --multicast 239.1.2.3
 ```
 
 **Loopback test** (sender and receiver on the same host — useful for
