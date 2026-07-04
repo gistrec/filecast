@@ -17,7 +17,7 @@ July 2026 — versions and features move, so if you spot an error please
 | Zero receiver setup (one binary, one command) | ✅ | ✅ | ❌ per-receiver daemon [^uftp-daemon] | ✅ | ⚠️ GUI app install | ⚠️ pip or distro package |
 | Resume an interrupted transfer | ✅ `--resume` | ❌ [^udpcast-streaming] | ⚠️ session restart [^uftp-restart] | ✅ | ❌ open feature request since 2023 | ❌ open feature request since 2016 |
 | End-to-end file integrity check | ✅ SHA-256 [^filecast-hash] | ❌ [^udpcast-integrity] | ⚠️ [^uftp-integrity] | ✅ [^croc-hash] | ✅ (TLS transport) | ✅ (encrypted transport) |
-| Encryption | ❌ not yet | ❌ [^udpcast-pipe] | ✅ default since v5.0 [^uftp-crypto] | ✅ end-to-end (PAKE) | ✅ HTTPS by default [^localsend-tls] | ✅ end-to-end (PAKE) |
+| Encryption | ❌ [not yet](https://github.com/gistrec/filecast/issues/22) | ❌ [^udpcast-pipe] | ✅ default since v5.0 [^uftp-crypto] | ✅ end-to-end (PAKE) | ✅ HTTPS by default [^localsend-tls] | ✅ end-to-end (PAKE) |
 | Interface | CLI | CLI | CLI (daemon) | CLI | GUI [^localsend-cli] | CLI |
 | License | MIT | GPL-2.0 | GPL-3.0 [^uftp-license] | MIT | Apache-2.0 | MIT |
 | Latest release when checked (2026-07) | v1.0.0 (2026-07) | 2025-02 | 2023-12 | 2026-07 | 2025-02 [^localsend-activity] | 2026-05 |

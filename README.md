@@ -71,6 +71,12 @@ filecast send photo.jpg --to 192.168.1.50
 
 ## Installation
 
+**Homebrew** (macOS, Linux):
+
+```sh
+brew install gistrec/filecast/filecast
+```
+
 **One-liner** (Linux, macOS):
 
 ```sh
