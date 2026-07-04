@@ -3,7 +3,7 @@
 # GitHub Releases, verifies its SHA-256 against the release's checksums.txt,
 # and installs it as `filecast`.
 #
-#   curl -fsSL https://raw.githubusercontent.com/gistrec/Filecast/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/gistrec/filecast/master/install.sh | sh
 #
 # Options (flags or environment variables):
 #   --version vX.Y.Z   / FILECAST_VERSION   install a specific release (default: latest)
@@ -13,7 +13,7 @@
 # partially downloaded script fails to parse instead of running half-way.
 set -eu
 
-REPO="gistrec/Filecast"
+REPO="gistrec/filecast"
 # Overridable base URL so the script can be tested against a local mock server.
 DOWNLOAD_BASE="${FILECAST_DOWNLOAD_BASE:-https://github.com/${REPO}/releases}"
 
