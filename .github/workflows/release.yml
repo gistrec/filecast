@@ -1,22 +1,36 @@
 name: Release
 
+# workflow_dispatch runs the full build matrix (a dry run to validate the
+# release configuration); the release job itself only fires on a v* tag.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    # Linux builds run inside debian:bullseye (glibc 2.31), so the binaries
+    # work on Ubuntu 20.04+/Debian 11+ regardless of which Ubuntu version the
+    # runner label points at; libstdc++/libgcc are linked statically for the
+    # same reason.
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            container: debian:bullseye
             artifact_name: filecast
             asset_name: filecast-linux-x86_64
+          - os: ubuntu-24.04-arm
+            container: debian:bullseye
+            artifact_name: filecast
+            asset_name: filecast-linux-arm64
+          # One universal binary covers Apple Silicon and Intel Macs.
           - os: macos-latest
             artifact_name: filecast
-            asset_name: filecast-macos-arm64
+            asset_name: filecast-macos-universal
           - os: windows-latest
             artifact_name: filecast.exe
             asset_name: filecast-windows-x86_64.exe
@@ -26,6 +40,12 @@ jobs:
         shell: ${{ matrix.os == 'windows-latest' && 'msys2 {0}' || 'bash' }}
 
     steps:
+      - name: Install build tools (Linux container)
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends g++ cmake make git ca-certificates
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -47,15 +67,41 @@ jobs:
                   -DBUILD_TESTING=OFF \
                   -DFILECAST_VERSION="${VERSION}" \
                   -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++"
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            # Without an explicit deployment target the binary refuses to run
+            # on any macOS older than the runner's own version.
+            cmake -S . -B build \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DBUILD_TESTING=OFF \
+                  -DFILECAST_VERSION="${VERSION}" \
+                  -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                  -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
           else
             cmake -S . -B build \
                   -DCMAKE_BUILD_TYPE=Release \
                   -DBUILD_TESTING=OFF \
-                  -DFILECAST_VERSION="${VERSION}"
+                  -DFILECAST_VERSION="${VERSION}" \
+                  -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
           fi
 
       - name: Build
         run: cmake --build build --config Release
+
+      - name: Smoke-test the binary
+        run: |
+          ./build/${{ matrix.artifact_name }} --version
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            lipo -archs build/${{ matrix.artifact_name }} | grep -q x86_64
+            lipo -archs build/${{ matrix.artifact_name }} | grep -q arm64
+            # Both slices must target macOS 11, not the runner's OS version.
+            for arch in arm64 x86_64; do
+              otool -arch "$arch" -l build/${{ matrix.artifact_name }} \
+                | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' > "target-$arch.txt"
+              grep -E 'minos|version' "target-$arch.txt" || true
+              grep -qE '(minos|version) 11\.' "target-$arch.txt" \
+                || { echo "wrong deployment target for $arch"; exit 1; }
+            done
+          fi
 
       - name: Stage artifact
         run: |
@@ -71,6 +117,7 @@ jobs:
 
   release:
     needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -83,10 +130,19 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # install.sh downloads checksums.txt from the release and refuses to
+      # install a binary whose SHA-256 does not match.
+      - name: Generate checksums.txt
+        run: |
+          cd artifacts
+          sha256sum -- * > checksums.txt
+          cat checksums.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
