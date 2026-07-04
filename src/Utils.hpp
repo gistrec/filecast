@@ -17,6 +17,7 @@
 #define INVALID_SOCKET (-1)
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>   // ip_mreq, IP_ADD_MEMBERSHIP, IPPROTO_IP (not guaranteed via arpa/inet.h)
 #define CLOSE_SOCKET(s) close(s)
 #define CLEANUP_NETWORK() ((void)0)
 #endif

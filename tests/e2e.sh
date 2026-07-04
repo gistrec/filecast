@@ -34,6 +34,11 @@ run_test() {
     local recv_log="$WORKDIR/recv-$label.log"
     local send_log="$WORKDIR/send-$label.log"
 
+    # Destination flags: unicast loopback by default; overridable (e.g. multicast).
+    # Split into an array so a multi-word DEST expands into separate arguments.
+    local dest
+    read -ra dest <<< "${DEST:---to 127.0.0.1}"
+
     echo "==> [$label] generating ${size_kb} KiB file"
     dd if=/dev/urandom of="$src" bs=1024 count="$size_kb" status=none
 
@@ -41,7 +46,7 @@ run_test() {
     # --delay-ms 0 removes the inter-packet pause that the protocol uses on real
     # LANs to avoid overrunning receivers; on loopback it just slows tests down.
     echo "==> [$label] starting receiver (bind=$recv_port, target=$send_port)"
-    "$BINARY" receive "$dst" --to 127.0.0.1 \
+    "$BINARY" receive "$dst" "${dest[@]}" \
               --bind-port "$recv_port" --port "$send_port" --ttl "$recv_ttl" \
               --delay-ms 0 \
         > "$recv_log" 2>&1 &
@@ -52,7 +57,7 @@ run_test() {
 
     # Sender listens on $send_port, sends TRANSFER to $recv_port (receiver's bind).
     echo "==> [$label] starting sender (bind=$send_port, target=$recv_port)"
-    if ! "$BINARY" send "$src" --to 127.0.0.1 \
+    if ! "$BINARY" send "$src" "${dest[@]}" \
                    --bind-port "$send_port" --port "$recv_port" --ttl "$send_ttl" \
                    --delay-ms 0 \
             > "$send_log" 2>&1; then
@@ -106,6 +111,36 @@ run_test "small" 50    33401 33402 3 1
 
 # Large file: 2 MiB -> ~1400 parts at default MTU 1500.
 run_test "large" 2048  33403 33404 3 1
+
+# Multicast: same protocol over an IP multicast group. Some CI/loopback setups
+# lack multicast routing, so first probe whether a group datagram is delivered
+# at all. Only when the environment supports it do we run the transfer as a hard
+# test — so a real regression in the join/addressing logic fails the suite,
+# rather than being masked as "unavailable".
+mc_available() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - <<'PY' 2>/dev/null
+import socket, struct, sys
+group, port = "239.255.42.99", 34099
+try:
+    r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    r.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    r.bind(("", port))
+    mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
+    r.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    r.settimeout(1.0)
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"probe", (group, port))
+    sys.exit(0 if r.recvfrom(16)[0] == b"probe" else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+if mc_available; then
+    DEST="--multicast 239.255.42.99" run_test "multicast" 50 33405 33406 3 1
+else
+    echo "SKIP: [multicast] not available in this environment"
+fi
 
 echo
 echo "All E2E tests passed."

@@ -27,6 +27,10 @@ namespace {
 // Result of picking the subcommand off argv[1].
 enum class Command { Send, Receive, Handled };
 
+// How packets are addressed: LAN broadcast (default), one host (--to), or an
+// IP multicast group (--multicast).
+enum class SendMode { Broadcast, Unicast, Multicast };
+
 // Everything parsed from the CLI, validated and ready to act on.
 struct CliOptions {
     int         mtu       = 1500;
@@ -37,8 +41,8 @@ struct CliOptions {
     int64_t     pace_us   = 0;          // inter-packet pause derived from rate/delay
     std::string file;
     bool        file_from_cli = false;  // true if the user named the file
-    bool        use_broadcast = true;   // false when --to <ip> is given
-    std::string target;                 // destination IP for unicast
+    SendMode    mode      = SendMode::Broadcast;
+    std::string target;                 // IP for unicast / group for multicast
     bool        verbose   = false;      // per-packet logging instead of a bar
     bool        overwrite = false;      // allow overwriting an existing file
 };
@@ -52,6 +56,7 @@ void buildOptions(cxxopts::Options& options) {
     options.add_options()
         ("f,file",    "File to send, or where to save it when receiving", cxxopts::value<std::string>())
         ("to",        "Send to this IPv4 address instead of LAN broadcast", cxxopts::value<std::string>())
+        ("multicast", "Use this IPv4 multicast group (224.0.0.0-239.255.255.255)", cxxopts::value<std::string>())
         ("p,port",    "Destination UDP port",                 cxxopts::value<int>()->default_value("33333"))
         ("bind-port", "Local UDP port to bind on",            cxxopts::value<int>()->default_value("33333"))
         ("mtu",       "Max packet size in bytes",             cxxopts::value<int>()->default_value("1500"))
@@ -74,7 +79,8 @@ void printUsage(cxxopts::Options& options, std::ostream& os) {
        << "\nExamples:\n"
        << "  filecast send photo.jpg\n"
        << "  filecast receive\n"
-       << "  filecast send photo.jpg --to 192.168.1.50 --rate 500\n";
+       << "  filecast send photo.jpg --to 192.168.1.50 --rate 500\n"
+       << "  filecast send photo.jpg --multicast 239.1.2.3\n";
 }
 
 // Peel the subcommand off argv[1], handling global --help/--version. Sets
@@ -167,9 +173,74 @@ bool collectOptions(const cxxopts::ParseResult& result, bool is_sender, CliOptio
     opt.file          = has_file ? result["file"].as<std::string>() : std::string();
     opt.file_from_cli = has_file;
 
-    opt.use_broadcast = (result.count("to") == 0);
-    opt.target = opt.use_broadcast ? std::string() : result["to"].as<std::string>();
+    // Destination mode: default broadcast, --to <ip> unicast, --multicast <group>.
+    if (result.count("to") && result.count("multicast")) {
+        std::cerr << "Error: --to and --multicast are mutually exclusive" << std::endl;
+        return false;
+    }
+    if (result.count("multicast")) {
+        opt.mode = SendMode::Multicast;
+        opt.target = result["multicast"].as<std::string>();
+    } else if (result.count("to")) {
+        opt.mode = SendMode::Unicast;
+        opt.target = result["to"].as<std::string>();
+    } else {
+        opt.mode = SendMode::Broadcast;
+    }
     return true;
+}
+
+// Fill broadcast_address with the destination and apply mode-specific options
+// (enable SO_BROADCAST / validate a multicast group). Returns 0 on success.
+int configureDestination(const CliOptions& opt) {
+    broadcast_address.sin_family = AF_INET;
+    broadcast_address.sin_port = htons(static_cast<uint16_t>(opt.port));
+
+    if (opt.mode == SendMode::Broadcast) {
+        int broadcastEnable = 1;
+        if (setsockopt(_socket, SOL_SOCKET, SO_BROADCAST,
+                       reinterpret_cast<const char*>(&broadcastEnable),
+                       sizeof(broadcastEnable)) != 0) {
+            std::cerr << "Error: Can't get access to broadcast" << std::endl;
+            return 1;
+        }
+        if (verbose) std::cout << "Ok: Got access to broadcast" << std::endl;
+        broadcast_address.sin_addr.s_addr = INADDR_BROADCAST;
+        return 0;
+    }
+
+    const char* flag = (opt.mode == SendMode::Multicast) ? "--multicast" : "--to";
+    if (inet_pton(AF_INET, opt.target.c_str(), &broadcast_address.sin_addr) != 1) {
+        std::cerr << "Error: " << flag << " must be a valid IPv4 address" << std::endl;
+        return 1;
+    }
+    if (opt.mode == SendMode::Multicast) {
+        // 224.0.0.0/4 — top four bits are 1110. Default IP_MULTICAST_TTL (1) and
+        // IP_MULTICAST_LOOP (on) suit a single subnet and same-host tests, so we
+        // leave them unset and avoid the platform-specific option-type quirks.
+        uint32_t host = ntohl(broadcast_address.sin_addr.s_addr);
+        if ((host >> 28) != 0xE) {
+            std::cerr << "Error: --multicast must be in 224.0.0.0-239.255.255.255" << std::endl;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Join the multicast group so this socket receives packets addressed to it
+// (both the receiver's data and the sender's view of RESENDs). No-op otherwise.
+int joinMulticast(const CliOptions& opt) {
+    if (opt.mode != SendMode::Multicast) return 0;
+    struct ip_mreq mreq;
+    mreq.imr_multiaddr = broadcast_address.sin_addr;
+    mreq.imr_interface.s_addr = INADDR_ANY;
+    if (setsockopt(_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   reinterpret_cast<const char*>(&mreq), sizeof(mreq)) != 0) {
+        std::cerr << "Error: Can't join multicast group " << opt.target << std::endl;
+        return 1;
+    }
+    if (verbose) std::cout << "Ok: Joined multicast group " << opt.target << std::endl;
+    return 0;
 }
 
 // Create the socket, apply options and bind. Returns a process exit code
@@ -202,24 +273,8 @@ int setupSocket(const CliOptions& opt) {
 
     memcpy(&server_address, &client_address, sizeof(server_address));
 
-    broadcast_address.sin_family = AF_INET;
-    broadcast_address.sin_port = htons(static_cast<uint16_t>(opt.port));
-
-    if (opt.use_broadcast) {
-        int broadcastEnable = 1;
-        if (setsockopt(_socket, SOL_SOCKET, SO_BROADCAST,
-                       reinterpret_cast<const char*>(&broadcastEnable),
-                       sizeof(broadcastEnable)) != 0) {
-            std::cerr << "Error: Can't get access to broadcast" << std::endl;
-            cleanupAndExit(1);
-        }
-        if (verbose) std::cout << "Ok: Got access to broadcast" << std::endl;
-        broadcast_address.sin_addr.s_addr = INADDR_BROADCAST;
-    } else {
-        if (inet_pton(AF_INET, opt.target.c_str(), &broadcast_address.sin_addr) != 1) {
-            std::cerr << "Error: --to must be a valid IPv4 address" << std::endl;
-            cleanupAndExit(1);
-        }
+    if (configureDestination(opt) != 0) {
+        cleanupAndExit(1);
     }
 
     if (bind(_socket, reinterpret_cast<sockaddr*>(&client_address), sizeof(client_address)) != 0) {
@@ -227,6 +282,12 @@ int setupSocket(const CliOptions& opt) {
         cleanupAndExit(1);
     }
     if (verbose) std::cout << "Ok: Socket bound" << std::endl;
+
+    // Joining the group must happen after bind so the membership sticks to the
+    // bound port. Broadcast/unicast modes are no-ops here.
+    if (joinMulticast(opt) != 0) {
+        cleanupAndExit(1);
+    }
 
     #if defined(_WIN32) || defined(_WIN64)
     DWORD tv = 1000;  // user timeout in milliseconds [ms]
