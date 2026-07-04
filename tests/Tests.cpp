@@ -65,6 +65,77 @@ TEST(Sha256, DetectsSingleBitFlip) {
     EXPECT_NE(sha256Hex(a), sha256Hex(b));
 }
 
+// --- Wire framing (common header) -------------------------------------------
+
+TEST(Protocol, HeaderRoundTrip) {
+    char buf[Protocol::HEADER_SIZE];
+    Protocol::writeHeader(buf, Protocol::Type::Transfer, 0xDEADBEEFu);
+    EXPECT_EQ(memcmp(buf, "FCST", 4), 0);
+
+    Protocol::Header h;
+    EXPECT_EQ(Protocol::parseHeader(buf, sizeof(buf), h), Protocol::Parse::Ok);
+    EXPECT_EQ(h.version, Protocol::VERSION);
+    EXPECT_EQ(h.type, Protocol::Type::Transfer);
+    EXPECT_EQ(h.session, 0xDEADBEEFu);
+}
+
+TEST(Protocol, HeaderRejectsShortAndForeign) {
+    char buf[Protocol::HEADER_SIZE];
+    Protocol::writeHeader(buf, Protocol::Type::Finish, 42);
+
+    Protocol::Header h;
+    // Truncated: even one byte short of the header is not ours.
+    EXPECT_EQ(Protocol::parseHeader(buf, Protocol::HEADER_SIZE - 1, h), Protocol::Parse::NotOurs);
+    EXPECT_EQ(Protocol::parseHeader(buf, 0, h), Protocol::Parse::NotOurs);
+
+    // Wrong magic: stray traffic (including the old text-tagged v2 packets)
+    // must be silently ignored, not misparsed.
+    char stray[16] = {0};
+    memcpy(stray, "NEW_PACKET", 10);
+    EXPECT_EQ(Protocol::parseHeader(stray, sizeof(stray), h), Protocol::Parse::NotOurs);
+}
+
+TEST(Protocol, HeaderAcceptsUnknownType) {
+    // Forward compatibility contract: an unknown type byte within the current
+    // version parses Ok — the dispatcher ignores it — rather than being
+    // mistaken for foreign traffic.
+    char buf[Protocol::HEADER_SIZE];
+    Protocol::writeHeader(buf, static_cast<Protocol::Type>(200), 99);
+
+    Protocol::Header h;
+    EXPECT_EQ(Protocol::parseHeader(buf, sizeof(buf), h), Protocol::Parse::Ok);
+    EXPECT_EQ(static_cast<uint8_t>(h.type), 200);
+    EXPECT_EQ(h.session, 99u);
+}
+
+TEST(Protocol, HeaderReportsForeignVersion) {
+    char buf[Protocol::HEADER_SIZE];
+    Protocol::writeHeader(buf, Protocol::Type::Announce, 7);
+    buf[4] = static_cast<char>(Protocol::VERSION + 1);
+
+    Protocol::Header h;
+    EXPECT_EQ(Protocol::parseHeader(buf, sizeof(buf), h), Protocol::Parse::BadVersion);
+    // The header is still filled in so the caller can say which version it saw.
+    EXPECT_EQ(h.version, Protocol::VERSION + 1);
+    EXPECT_EQ(h.session, 7u);
+}
+
+TEST(Protocol, FieldHelpersRoundTrip) {
+    char buf[4];
+    for (uint32_t v : {0u, 1u, 0xFFu, 0x1234u, 0xFFFFu, 0x12345678u, 0xFFFFFFFFu}) {
+        Protocol::putU32(buf, v);
+        EXPECT_EQ(Protocol::getU32(buf), v);
+    }
+    for (uint16_t v : {uint16_t{0}, uint16_t{1}, uint16_t{0x1234}, uint16_t{0xFFFF}}) {
+        Protocol::putU16(buf, v);
+        EXPECT_EQ(Protocol::getU16(buf), v);
+    }
+    // Big-endian on the wire: most significant byte first.
+    Protocol::putU32(buf, 0x0A0B0C0Du);
+    EXPECT_EQ(buf[0], 0x0A);
+    EXPECT_EQ(buf[3], 0x0D);
+}
+
 // --- Protocol helpers -------------------------------------------------------
 
 TEST(Protocol, SanitizeNameStripsDirectories) {

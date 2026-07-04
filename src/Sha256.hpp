@@ -3,7 +3,7 @@
 
 // Small self-contained SHA-256 (public-domain algorithm, FIPS 180-4). Used to
 // verify the integrity of a received file against the digest the sender puts in
-// NEW_PACKET. Header-only so it stays dependency-free like the rest of filecast.
+// the ANNOUNCE. Header-only so it stays dependency-free like the rest of filecast.
 
 #include <cstdint>
 #include <cstddef>

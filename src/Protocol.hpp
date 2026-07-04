@@ -6,11 +6,107 @@
 // makes it testable without spinning up sockets.
 
 #include <cstddef>
+#include <cstdint>
 #include <cctype>
 #include <algorithm>
 #include <string>
 
 namespace Protocol {
+
+// ---- Wire framing (protocol v3) ---------------------------------------------
+//
+// Every packet starts with the same 10-byte header:
+//
+//   magic "FCST"(4) + version(1) + type(1) + session(4)
+//
+// The 4-byte magic keeps stray UDP traffic on our port from being misparsed
+// (and is still recognizable to a human reading a tcpdump hex dump); carrying
+// the version in every packet — not just the announcement — means any future
+// format change degrades into a clear one-line warning instead of silence.
+// The header layout itself is the compatibility contract: future versions keep
+// these 10 bytes so old builds can still say *why* they are ignoring traffic.
+
+constexpr char    MAGIC[4] = {'F', 'C', 'S', 'T'};
+constexpr uint8_t VERSION  = 3;
+
+enum class Type : uint8_t {
+    Announce = 1,  // transfer metadata: file size, chunk size, sha256, name
+    Transfer = 2,  // one chunk of file data
+    Finish   = 3,  // sender has sent every part
+    Resend   = 4,  // receiver asks for a lost part
+};
+
+constexpr size_t HEADER_SIZE = 10;
+// Fixed part of ANNOUNCE, before the variable-length file name:
+// header + file_size(4) + chunk_size(4) + sha256(32) + name_len(2).
+constexpr size_t ANNOUNCE_FIXED = HEADER_SIZE + 42;
+// TRANSFER framing before the payload: header + part(4) + length(4).
+constexpr size_t TRANSFER_HEADER = HEADER_SIZE + 8;
+constexpr size_t FINISH_SIZE = HEADER_SIZE;
+constexpr size_t RESEND_SIZE = HEADER_SIZE + 4;  // header + part(4)
+
+// Big-endian field helpers, self-contained so this header stays socket-free
+// (Utils.hpp drags in the platform socket headers).
+inline void putU16(char* p, uint16_t v) {
+    p[0] = static_cast<char>(v >> 8);
+    p[1] = static_cast<char>(v);
+}
+
+inline void putU32(char* p, uint32_t v) {
+    p[0] = static_cast<char>(v >> 24);
+    p[1] = static_cast<char>(v >> 16);
+    p[2] = static_cast<char>(v >> 8);
+    p[3] = static_cast<char>(v);
+}
+
+inline uint16_t getU16(const char* p) {
+    return static_cast<uint16_t>((static_cast<unsigned char>(p[0]) << 8) |
+                                 static_cast<unsigned char>(p[1]));
+}
+
+inline uint32_t getU32(const char* p) {
+    return (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8) |
+           static_cast<uint32_t>(static_cast<unsigned char>(p[3]));
+}
+
+struct Header {
+    uint8_t  version = 0;
+    Type     type    = Type::Announce;  // may hold a value outside the enum
+    uint32_t session = 0;
+};
+
+enum class Parse {
+    Ok,          // ours, current version; header filled in
+    NotOurs,     // too short or wrong magic — silently ignore
+    BadVersion,  // our magic, different version — worth a (single) warning
+};
+
+// Write the common header. The caller guarantees buf holds HEADER_SIZE bytes.
+inline void writeHeader(char* buf, Type type, uint32_t session) {
+    buf[0] = MAGIC[0];
+    buf[1] = MAGIC[1];
+    buf[2] = MAGIC[2];
+    buf[3] = MAGIC[3];
+    buf[4] = static_cast<char>(VERSION);
+    buf[5] = static_cast<char>(type);
+    putU32(buf + 6, session);
+}
+
+// Validate the magic/version and extract the header fields. On BadVersion the
+// header is still filled in, so the caller can report which version it saw.
+inline Parse parseHeader(const char* buf, size_t length, Header& h) {
+    if (length < HEADER_SIZE) return Parse::NotOurs;
+    if (buf[0] != MAGIC[0] || buf[1] != MAGIC[1] ||
+        buf[2] != MAGIC[2] || buf[3] != MAGIC[3]) {
+        return Parse::NotOurs;
+    }
+    h.version = static_cast<uint8_t>(buf[4]);
+    h.type    = static_cast<Type>(buf[5]);
+    h.session = getU32(buf + 6);
+    return (h.version == VERSION) ? Parse::Ok : Parse::BadVersion;
+}
 
 // Valid chunk size range (the sender's --mtu bounds). The lower bound also caps
 // the part count, so a forged tiny chunk cannot blow up the receiver.

@@ -1,29 +1,47 @@
-# Filecast wire protocol (v2)
+# Filecast wire protocol (v3)
 
-Four packet types over UDP. All multi-byte fields are big-endian. Every packet
-carries a 32-bit session id chosen randomly by the sender, so a receiver
-ignores traffic from a different (or restarted) sender.
+Four packet types over UDP. All multi-byte fields are big-endian.
 
-## Packet layouts
+## Common header
 
-| Packet | Layout |
-| ------ | ------ |
-| `NEW_PACKET` | `"NEW_PACKET"` · version(2) · session(4) · file_size(4) · chunk_size(4) · sha256(32) · name_len(2) · name |
-| `TRANSFER` | `"TRANSFER"` · session(4) · part(4) · length(4) · data |
-| `FINISH` | `"FINISH"` · session(4) |
-| `RESEND` | `"RESEND"` · session(4) · part(4) |
+Every packet starts with the same 10-byte header:
+
+| Field | Size | Value |
+| ----- | ---- | ----- |
+| magic | 4 | `"FCST"` |
+| version | 1 | `3` |
+| type | 1 | `1` ANNOUNCE · `2` TRANSFER · `3` FINISH · `4` RESEND |
+| session | 4 | random id chosen by the sender per transfer |
+
+The magic keeps stray UDP traffic on the port from being misparsed (and is
+still recognizable to a human reading a tcpdump hex dump). The session id is
+stamped into every packet so a receiver ignores traffic from a different (or
+restarted) sender. The version travels in every packet — a receiver that sees
+the filecast magic with an unknown version reports it once and ignores the
+traffic, so a version-mixed LAN fails loudly instead of silently. The header
+layout itself is the compatibility contract: future protocol versions keep
+these 10 bytes.
+
+## Packet bodies
+
+| Packet | Body (after the common header) |
+| ------ | ------------------------------ |
+| `ANNOUNCE` | file_size(4) · chunk_size(4) · sha256(32) · name_len(2) · name |
+| `TRANSFER` | part(4) · length(4) · data |
+| `FINISH` | — |
+| `RESEND` | part(4) |
 
 ## Transfer sequence
 
-1. The sender broadcasts a `NEW_PACKET` announcing a random session id, the
-   total file size, the chunk size, the file's SHA-256, and its name.
+1. The sender broadcasts an `ANNOUNCE` carrying a random session id, the total
+   file size, the chunk size, the file's SHA-256, and its name.
 2. Each receiver latches that session, allocates a buffer, and clears its part
-   registry. Packets from any other session are ignored. The chunk size is
-   taken from the announcement, so sender and receivers never disagree about
-   part boundaries even with mismatched `--mtu` settings.
+   registry. The chunk size is taken from the announcement, so sender and
+   receivers never disagree about part boundaries even with mismatched `--mtu`
+   settings.
 3. The sender splits the file into chunk-sized pieces and broadcasts each one
-   as a `TRANSFER` packet, tagged with the session id, at the configured rate.
-4. The sender broadcasts a `FINISH` packet when all chunks have been sent.
+   as a `TRANSFER` packet at the configured rate.
+4. The sender broadcasts `FINISH` when all chunks have been sent.
 5. Each receiver scans for missing chunks and requests them with `RESEND`
    packets.
 6. The sender retransmits each requested chunk.
@@ -39,9 +57,8 @@ part for everyone who missed it.
 
 ## Protocol versioning
 
-The version field in `NEW_PACKET` is checked by receivers: an announcement
-carrying an unknown version is reported and ignored. Announcements from the
-pre-v2 protocol have no version field at all and are shorter than the v2
-fixed header, so they are silently ignored as truncated. The v2 format
-(SHA-256, in-band file name, negotiated chunk size) is not compatible with
-the v1 format used before release v1.0.0.
+A packet carrying the filecast magic with any version other than 3 is dropped,
+and the receiver (or the sender, for RESENDs) prints a single warning naming
+both versions. Packets without the magic — including packets from the
+pre-release v1/v2 formats, which used text markers instead of this header —
+are silently ignored as unrelated traffic.

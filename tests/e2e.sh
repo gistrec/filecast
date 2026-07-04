@@ -170,6 +170,41 @@ run_iface_validation() {
 }
 run_iface_validation
 
+# Announced-name delivery: run `receive` with NO output path, so the file must
+# be saved under the name carried in the ANNOUNCE. This is the only test that
+# exercises the name_len/name wire fields — every other case passes an explicit
+# output path, which discards the announced name.
+run_announced_name_test() {
+    local dir="$WORKDIR/announced-name"
+    mkdir -p "$dir/send" "$dir/recv"
+    dd if=/dev/urandom of="$dir/send/announced-name.bin" bs=1024 count=50 status=none
+
+    echo "==> [name] starting receiver with no output path"
+    ( cd "$dir/recv" && exec "$BINARY" receive --to 127.0.0.1 \
+          --bind-port 33409 --port 33410 --ttl 5 --delay-ms 0 > recv.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/send/announced-name.bin" --to 127.0.0.1 \
+              --bind-port 33410 --port 33409 --ttl 2 --delay-ms 0 \
+              > "$dir/send.log" 2>&1
+    if ! wait "$rpid"; then
+        echo "FAIL: [name] receiver exited non-zero"
+        cat "$dir/recv/recv.log"
+        return 1
+    fi
+    if [ ! -f "$dir/recv/announced-name.bin" ]; then
+        echo "FAIL: [name] file was not saved under the announced name"
+        ls "$dir/recv"; tail -5 "$dir/recv/recv.log"
+        return 1
+    fi
+    if ! cmp -s "$dir/send/announced-name.bin" "$dir/recv/announced-name.bin"; then
+        echo "FAIL: [name] file saved under the announced name does not match source"
+        return 1
+    fi
+    echo "PASS: [name] file delivered under its announced name"
+}
+run_announced_name_test
+
 # Resume: interrupt a slow receive with SIGINT, then finish it with --resume.
 # Timing-based, so if no snapshot lands (transfer finished or nothing arrived in
 # the window) it SKIPs; but once a snapshot exists, resume must succeed or FAIL.

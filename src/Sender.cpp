@@ -2,6 +2,7 @@
 #include "Config.hpp"
 #include "Sha256.hpp"
 #include "Progress.hpp"
+#include "Protocol.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -20,26 +21,14 @@ using namespace std::chrono_literals;
 
 namespace Sender {
 
-// TRANSFER header: "TRANSFER"(8) + session id(4) + part number(4) + length(4).
-constexpr int HEADER_SIZE = 20;
-
-// Wire protocol version, announced in NEW_PACKET so a receiver can reject a
-// sender it does not understand instead of misparsing the stream.
-constexpr uint16_t PROTOCOL_VERSION = 2;
-
-// NEW_PACKET v2 fixed header, before the variable-length file name:
-// "NEW_PACKET"(10) + version(2) + session(4) + file_length(4) + chunk_size(4)
-// + sha256(32) + name_len(2) = 58 bytes.
-constexpr int NEW_PACKET_FIXED = 58;
-
 // Random per-transfer id, generated in run() and stamped into every packet so a
 // receiver can reject packets from a different sender (a second concurrent
 // sender, or a restart) instead of silently mixing two files into one buffer.
 uint32_t session_id = 0;
 
-// The file size is announced in a 4-byte field in NEW_PACKET, so anything that
-// does not fit into 32 bits would be silently truncated on the wire (a 4 GiB
-// file would be announced as 0). Reject such files up front instead.
+// The file size travels in a 4-byte ANNOUNCE field, so anything that does not
+// fit into 32 bits would be silently truncated on the wire (a 4 GiB file would
+// be announced as 0). Reject such files up front instead.
 constexpr size_t MAX_WIRE_FILE_LENGTH = 0xFFFFFFFFULL;
 
 // Strip any directory part; only the base name travels on the wire so the
@@ -61,13 +50,12 @@ void sendPart(size_t part_index) {
     size_t packet_length = file_length - offset;
     if (packet_length > static_cast<size_t>(mtu)) packet_length = static_cast<size_t>(mtu);
 
-    snprintf(buffer, 9, "TRANSFER");
-    Utils::writeBytesFromNumber(buffer +  8, session_id,    4); // Write section "session"
-    Utils::writeBytesFromNumber(buffer + 12, part_index,    4); // Write section "number"
-    Utils::writeBytesFromNumber(buffer + 16, packet_length, 4); // Write section "length"
-    memcpy(buffer + 20, file + offset, packet_length);          // Write section "data"
+    Protocol::writeHeader(buffer, Protocol::Type::Transfer, session_id);
+    Protocol::putU32(buffer + Protocol::HEADER_SIZE,     static_cast<uint32_t>(part_index));
+    Protocol::putU32(buffer + Protocol::HEADER_SIZE + 4, static_cast<uint32_t>(packet_length));
+    memcpy(buffer + Protocol::TRANSFER_HEADER, file + offset, packet_length);
 
-    auto sent = sendto(_socket, buffer, static_cast<int>(packet_length + HEADER_SIZE), 0,
+    auto sent = sendto(_socket, buffer, static_cast<int>(packet_length + Protocol::TRANSFER_HEADER), 0,
                        reinterpret_cast<sockaddr*>(&broadcast_address), sizeof(broadcast_address));
     if (sent < 0) {
         std::cerr << "Warning: Failed to send part " << part_index << std::endl;
@@ -84,9 +72,8 @@ void pace() {
 }
 
 void sendFinish() {
-    snprintf(buffer, 7, "FINISH");
-    Utils::writeBytesFromNumber(buffer + 6, session_id, 4);
-    if (sendto(_socket, buffer, 10, 0,
+    Protocol::writeHeader(buffer, Protocol::Type::Finish, session_id);
+    if (sendto(_socket, buffer, static_cast<int>(Protocol::FINISH_SIZE), 0,
                reinterpret_cast<sockaddr*>(&broadcast_address),
                sizeof(broadcast_address)) < 0) {
         std::cerr << "Warning: Failed to send FINISH" << std::endl;
@@ -137,9 +124,9 @@ int loadFileIntoMemory() {
     return 0;
 }
 
-// Build and broadcast NEW_PACKET (retransmitted a few times, since a single
+// Build and broadcast the ANNOUNCE (retransmitted a few times, since a single
 // drop would strand every receiver and there is no RESEND for it).
-void sendNewPacket() {
+void sendAnnounce() {
     std::random_device rd;
     session_id = static_cast<uint32_t>(rd());
 
@@ -149,28 +136,26 @@ void sendNewPacket() {
     if (verbose) std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
 
     // Name the receiver saves under unless it was given an explicit output path.
-    // Clamp so the whole NEW_PACKET fits the send buffer (2 * mtu) and the length
+    // Clamp so the whole ANNOUNCE fits the send buffer (2 * mtu) and the length
     // field (a byte count well under 2^16).
     std::string name = baseName(fileName);
-    size_t max_name = static_cast<size_t>(2 * mtu) - NEW_PACKET_FIXED;
+    size_t max_name = static_cast<size_t>(2 * mtu) - Protocol::ANNOUNCE_FIXED;
     if (max_name > 255) max_name = 255;
     if (name.size() > max_name) name.resize(max_name);
 
-    snprintf(buffer, 11, "NEW_PACKET");
-    Utils::writeBytesFromNumber(buffer + 10, PROTOCOL_VERSION,          2);
-    Utils::writeBytesFromNumber(buffer + 12, session_id,               4);
-    Utils::writeBytesFromNumber(buffer + 16, file_length,              4);
-    Utils::writeBytesFromNumber(buffer + 20, static_cast<size_t>(mtu), 4);
-    memcpy(buffer + 24, file_hash, 32);
-    Utils::writeBytesFromNumber(buffer + 56, name.size(),              2);
-    memcpy(buffer + NEW_PACKET_FIXED, name.data(), name.size());
-    int new_packet_len = NEW_PACKET_FIXED + static_cast<int>(name.size());
+    Protocol::writeHeader(buffer, Protocol::Type::Announce, session_id);
+    Protocol::putU32(buffer + Protocol::HEADER_SIZE,     static_cast<uint32_t>(file_length));
+    Protocol::putU32(buffer + Protocol::HEADER_SIZE + 4, static_cast<uint32_t>(mtu));
+    memcpy(buffer + Protocol::HEADER_SIZE + 8, file_hash, 32);
+    Protocol::putU16(buffer + Protocol::HEADER_SIZE + 40, static_cast<uint16_t>(name.size()));
+    memcpy(buffer + Protocol::ANNOUNCE_FIXED, name.data(), name.size());
+    int announce_len = static_cast<int>(Protocol::ANNOUNCE_FIXED + name.size());
 
     for (int i = 0; i < 3; ++i) {
-        if (sendto(_socket, buffer, new_packet_len, 0,
+        if (sendto(_socket, buffer, announce_len, 0,
                    reinterpret_cast<sockaddr*>(&broadcast_address),
                    sizeof(broadcast_address)) < 0) {
-            std::cerr << "Warning: Failed to send NEW_PACKET" << std::endl;
+            std::cerr << "Warning: Failed to send ANNOUNCE" << std::endl;
         }
         if (i + 1 < 3) pace();
     }
@@ -205,12 +190,26 @@ size_t serveResends(size_t total_parts) {
             continue;
         }
 
-        if (strncmp(buffer, "RESEND", 6) != 0) continue;
-        // Ignore RESENDs shorter than the header or belonging to a different
-        // session (another sender's receivers requesting their own transfer).
-        if (result < 14) continue;
-        if (Utils::getNumberFromBytes(buffer + 6, 4) != session_id) continue;
-        size_t part = Utils::getNumberFromBytes(buffer + 10, 4);
+        // The socket hears our own TRANSFER/FINISH broadcasts too; only RESENDs
+        // for our session and current protocol version matter here. A foreign
+        // version is reported once — it explains "why is nothing recovering".
+        Protocol::Header h;
+        Protocol::Parse parsed = Protocol::parseHeader(buffer, static_cast<size_t>(result), h);
+        if (parsed == Protocol::Parse::BadVersion) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::cerr << "Warning: ignoring packets with protocol version "
+                          << static_cast<int>(h.version) << " (this build speaks "
+                          << static_cast<int>(Protocol::VERSION) << ")" << std::endl;
+            }
+            continue;
+        }
+        if (parsed != Protocol::Parse::Ok) continue;
+        if (h.type != Protocol::Type::Resend) continue;
+        if (static_cast<size_t>(result) < Protocol::RESEND_SIZE) continue;
+        if (h.session != session_id) continue;
+        size_t part = Protocol::getU32(buffer + Protocol::HEADER_SIZE);
         if (part >= total_parts) continue;
 
         auto epoch    = std::chrono::system_clock::now().time_since_epoch();
@@ -248,7 +247,7 @@ int run() {
     }
     if (verbose) std::cout << "Ok: File successfully copied to RAM" << std::endl;
 
-    sendNewPacket();
+    sendAnnounce();
 
     const std::string name = baseName(fileName);
     Progress::Reporter reporter;
