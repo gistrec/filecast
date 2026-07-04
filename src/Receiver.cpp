@@ -230,7 +230,7 @@ bool readRawFile(const std::string& path, char* out, size_t max, size_t& got) {
     #if defined(_WIN32) || defined(_WIN64)
     std::ifstream in(path, std::ifstream::binary);
     if (!in.is_open()) return false;
-    in.read(out, static_cast<std::streamsize>(max));
+    in.read(out, static_cast<std::streamsize>(max));  // Flawfinder: ignore (out sized to max by caller)
     got = static_cast<size_t>(in.gcount());
     return true;
     #else
@@ -238,7 +238,7 @@ bool readRawFile(const std::string& path, char* out, size_t max, size_t& got) {
     if (fd < 0) return false;
     got = 0;
     while (got < max) {
-        ssize_t r = read(fd, out + got, max - got);
+        ssize_t r = read(fd, out + got, max - got);  // Flawfinder: ignore (loop bounded by got < max)
         if (r < 0) {
             if (errno == EINTR) continue;  // interrupted by a signal — retry
             close(fd);
