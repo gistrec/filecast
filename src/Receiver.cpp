@@ -21,8 +21,8 @@
 #include <set>
 
 #if !defined(_WIN32) && !defined(_WIN64)
-#include <fcntl.h>   // open, O_EXCL, O_NOFOLLOW
-#include <unistd.h>  // read, write, close
+#include <fcntl.h>   // open, O_EXCL, O_NOFOLLOW, AT_FDCWD
+#include <unistd.h>  // read, write, close, link, unlink
 #endif
 
 using namespace std::chrono_literals;
@@ -181,20 +181,29 @@ void syncParentDir(const std::string& path) {
 // path is rejected rather than followed/overwritten. Returns false on I/O error.
 bool writeTempFile(const std::string& tmp, const char* data, size_t len) {
     #if defined(_WIN32) || defined(_WIN64)
-    std::ofstream out(tmp, std::ofstream::binary | std::ofstream::trunc);
-    if (!out.is_open()) return false;
-    out.write(data, static_cast<std::streamsize>(len));
-    out.close();
-    if (!out) return false;
-    // std::ofstream::close only reaches the OS cache; force the payload to disk
-    // before the move so a power loss can't leave a torn/empty output (MoveFileEx
-    // WRITE_THROUGH flushes only cross-volume copies, not a same-volume rename).
-    HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // CREATE_NEW mirrors the POSIX O_EXCL below: a file planted at the temp
+    // path fails the create instead of being truncated. FlushFileBuffers forces
+    // the payload to disk before the move so a power loss can't leave a
+    // torn/empty output (MoveFileEx WRITE_THROUGH flushes only cross-volume
+    // copies, not a same-volume rename).
+    HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
-    BOOL flushed = FlushFileBuffers(h);
-    CloseHandle(h);
-    return flushed != 0;
+    bool ok = true;
+    for (size_t off = 0; off < len; ) {
+        // WriteFile takes a DWORD count; cap each write at 1 GiB.
+        DWORD chunk = (len - off > 0x40000000u) ? 0x40000000u
+                                                : static_cast<DWORD>(len - off);
+        DWORD wrote = 0;
+        if (!WriteFile(h, data + off, chunk, &wrote, nullptr) || wrote == 0) {
+            ok = false;
+            break;
+        }
+        off += wrote;
+    }
+    if (ok && !FlushFileBuffers(h)) ok = false;
+    if (!CloseHandle(h)) ok = false;
+    return ok;
     #else
     int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
     if (fd < 0) return false;
@@ -235,10 +244,51 @@ bool finalizeReplace(const std::string& tmp, const std::string& target) {
     #endif
 }
 
-// Write len bytes to a randomly-named temp beside `target`, then atomically move
-// it onto `target`. The random suffix keeps a hostile sender from predicting the
-// temp path. Returns a process exit code; on finalize failure the verified temp
-// is kept so no data is lost.
+// Outcome of the no-clobber finalize: moved into place, refused because the
+// target exists, or failed outright.
+enum class Finalize { Ok, Exists, Error };
+
+// Atomically move `tmp` onto `target` only if `target` does not exist. The
+// existence check and the move must be a single operation: a separate
+// exists()+rename() lets a file created between the two be silently replaced,
+// voiding the no-overwrite promise. Windows MoveFileEx without REPLACE_EXISTING
+// refuses an existing target atomically; on POSIX renameatx_np(RENAME_EXCL)
+// (macOS) and link()+unlink() both fail with EEXIST instead of replacing.
+// Filesystems supporting neither (FAT, some network mounts) fall back to
+// check+rename — non-atomic, but no worse than the pre-atomic behaviour.
+Finalize finalizeNoClobber(const std::string& tmp, const std::string& target) {
+    #if defined(_WIN32) || defined(_WIN64)
+    if (MoveFileExA(tmp.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH) != 0) {
+        return Finalize::Ok;
+    }
+    DWORD err = GetLastError();
+    return (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS)
+        ? Finalize::Exists : Finalize::Error;
+    #else
+    #if defined(__APPLE__)
+    if (renameatx_np(AT_FDCWD, tmp.c_str(), AT_FDCWD, target.c_str(), RENAME_EXCL) == 0) {
+        syncParentDir(target);
+        return Finalize::Ok;
+    }
+    if (errno == EEXIST) return Finalize::Exists;
+    // ENOTSUP and friends (e.g. SMB/NFS mounts): fall through to link().
+    #endif
+    if (link(tmp.c_str(), target.c_str()) == 0) {
+        unlink(tmp.c_str());  // best-effort; a leftover tmp loses no data
+        syncParentDir(target);
+        return Finalize::Ok;
+    }
+    if (errno == EEXIST) return Finalize::Exists;
+    if (fileExists(target)) return Finalize::Exists;
+    return finalizeReplace(tmp, target) ? Finalize::Ok : Finalize::Error;
+    #endif
+}
+
+// Write len bytes to a randomly-named temp beside `target`, then atomically
+// move it onto `target` — replacing an existing file only when --overwrite was
+// given. The random suffix keeps a hostile sender from predicting the temp
+// path. Returns a process exit code; on finalize failure the verified temp is
+// kept so no data is lost.
 int writeVerified(const std::string& target, const char* data, size_t len) {
     std::random_device rd;
     char suffix[24];
@@ -251,12 +301,28 @@ int writeVerified(const std::string& target, const char* data, size_t len) {
         std::remove(tmp.c_str());
         return 2;
     }
-    if (!finalizeReplace(tmp, target)) {
+    if (overwrite) {
+        if (finalizeReplace(tmp, target)) return 0;
         std::cerr << "Error: Failed to finalize " << target
                   << "; verified data kept at " << tmp << std::endl;
         return 2;
     }
-    return 0;
+    switch (finalizeNoClobber(tmp, target)) {
+        case Finalize::Ok:
+            return 0;
+        case Finalize::Exists:
+            // The target appeared after verifyAndWrite's early check (e.g. a
+            // second receiver in the same directory finished first).
+            std::cerr << "Error: output file " << target
+                      << " already exists (use --overwrite to replace it); "
+                      << "verified data kept at " << tmp << std::endl;
+            return 2;
+        case Finalize::Error:
+        default:
+            std::cerr << "Error: Failed to finalize " << target
+                      << "; verified data kept at " << tmp << std::endl;
+            return 2;
+    }
 }
 
 // Write len bytes to `path` (stable name, truncating). On POSIX O_NOFOLLOW
@@ -454,7 +520,9 @@ int verifyAndWrite() {
         return 2;
     }
 
-    // Refuse to clobber an existing file unless the user opted in.
+    // Refuse to clobber an existing file unless the user opted in. This check
+    // fails fast before the temp write; the atomic no-clobber finalize inside
+    // writeVerified is what enforces it when the file appears mid-write.
     if (!overwrite && fileExists(fileName)) {
         std::cerr << "Error: output file " << fileName
                   << " already exists (use --overwrite to replace it)" << std::endl;
