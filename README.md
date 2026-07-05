@@ -243,6 +243,10 @@ The snapshot is deleted once the file completes and its checksum verifies.
 - The v3 wire format stores the file size and part index in 4-byte fields. The
   receiver enforces a 4 GiB cap on the announced file size; the sender rejects
   files that do not fit the current wire-size field.
+- The sender streams payload from the source path after announcing its SHA-256.
+  Do not modify, truncate, replace, or delete the source file until the transfer
+  has finished, including any resend phase; otherwise receivers will reject the
+  result with a checksum mismatch or the sender will abort on a read error.
 - Receivers need enough free disk space for the in-progress `.part` file beside
   the final output. With `--resume`, the `.part` file and its `.part.idx` bitmap
   are kept after Ctrl+C or a timeout so a later run can continue. A hard kill

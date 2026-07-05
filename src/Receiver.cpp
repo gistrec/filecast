@@ -218,24 +218,7 @@ bool hashPartFile(uint8_t out[32]) {
     closePartFile(true);
     std::ifstream in(part_path, std::ifstream::binary);
     if (!in.is_open()) return false;
-
-    Sha256::Ctx ctx;
-    Sha256::init(ctx);
-    std::vector<char> hash_buf(1024 * 1024);
-    size_t total = 0;
-    while (in.good()) {
-        in.read(hash_buf.data(), static_cast<std::streamsize>(hash_buf.size()));
-        std::streamsize got = in.gcount();
-        if (got > 0) {
-            Sha256::update(ctx, reinterpret_cast<const uint8_t*>(hash_buf.data()),
-                           static_cast<size_t>(got));
-            total += static_cast<size_t>(got);
-        }
-        if (got == 0) break;
-    }
-    if (total != file_length) return false;
-    Sha256::finish(ctx, out);
-    return true;
+    return Sha256::hashStream(in, file_length, out);
 }
 
 void removePartFiles() {
@@ -477,8 +460,8 @@ constexpr size_t SNAPSHOT_HEADER = 51;
 // up where this one left off. Best-effort: a failure only means no resume.
 // Gated on --resume so a plain receive never leaves surprise .part files behind
 // (nor pays the synchronous whole-buffer write) when interrupted.
-void saveSnapshot() {
-    if (!resume || !storage_ready || !have_session) return;
+bool saveSnapshot() {
+    if (!resume || !storage_ready || !have_session) return false;
     closePartFile(true);
     size_t total = totalParts();
     std::vector<char> idx(SNAPSHOT_HEADER + (total + 7) / 8, 0);
@@ -487,8 +470,7 @@ void saveSnapshot() {
     Utils::writeBytesFromNumber(idx.data() + 39, file_length, 8);
     Utils::writeBytesFromNumber(idx.data() + 47, chunk_size,  4);
     for (size_t p : parts) idx[SNAPSHOT_HEADER + p / 8] |= static_cast<char>(1 << (p % 8));
-    writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
-    openPartFile(true);
+    return writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
 }
 
 // Remove the snapshot once the transfer has completed and been written out.
@@ -532,8 +514,8 @@ bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
 // Snapshot the partial file and clean up after Ctrl+C/SIGTERM. Returns 130.
 int onInterrupt(char* buffer) {
     reporter.finish();
-    saveSnapshot();
-    if (resume && storage_ready) {
+    bool saved = saveSnapshot();
+    if (saved) {
         std::cerr << "\nInterrupted; progress saved (retry with --resume)" << std::endl;
     } else {
         std::cerr << "\nInterrupted" << std::endl;
@@ -549,8 +531,8 @@ int onInterrupt(char* buffer) {
 // clean up. Returns 2. Mirrors the checkParts timeout path so both timeouts save.
 int onTimeout(char* buffer) {
     reporter.finish();
-    saveSnapshot();
-    if (resume && storage_ready) {
+    bool saved = saveSnapshot();
+    if (saved) {
         std::cerr << "Transfer timed out; progress saved (retry with --resume)" << std::endl;
     } else {
         removePartFiles();
@@ -563,9 +545,9 @@ int onTimeout(char* buffer) {
 // caller has already freed its receive buffer. Returns 2.
 int onRecoveryTimeout(size_t missing) {
     reporter.finish();  // clear the bar before the error line
-    saveSnapshot();     // keep progress so a later --resume can finish it
+    bool saved = saveSnapshot();  // keep progress so a later --resume can finish it
     std::cerr << "Error: Transfer timed out with " << missing << " part(s) missing";
-    if (resume) std::cerr << "; progress saved (retry with --resume)";
+    if (saved) std::cerr << "; progress saved (retry with --resume)";
     else removePartFiles();
     std::cerr << std::endl;
     return 2;

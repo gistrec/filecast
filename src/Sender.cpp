@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <map>
 #include <random>
-#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -47,8 +46,6 @@ std::string baseName(const std::string& path) {
 std::map<size_t, int64_t> sent_part;
 std::ifstream input_file;
 
-constexpr size_t HASH_BUFFER_SIZE = 1024 * 1024;
-
 bool readFileAt(size_t offset, char* out, size_t len) {
     input_file.clear();
     input_file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
@@ -57,7 +54,7 @@ bool readFileAt(size_t offset, char* out, size_t len) {
     return static_cast<size_t>(input_file.gcount()) == len;
 }
 
-void sendPart(size_t part_index) {
+bool sendPart(size_t part_index) {
     size_t offset        = part_index * static_cast<size_t>(mtu);
     size_t packet_length = file_length - offset;
     if (packet_length > static_cast<size_t>(mtu)) packet_length = static_cast<size_t>(mtu);
@@ -66,19 +63,21 @@ void sendPart(size_t part_index) {
     Protocol::putU32(buffer + Protocol::HEADER_SIZE,     static_cast<uint32_t>(part_index));
     Protocol::putU32(buffer + Protocol::HEADER_SIZE + 4, static_cast<uint32_t>(packet_length));
     if (!readFileAt(offset, buffer + Protocol::TRANSFER_HEADER, packet_length)) {
-        std::cerr << "Warning: Failed to read part " << part_index << std::endl;
-        return;
+        std::cerr << "Error: Failed to read part " << part_index
+                  << " from " << fileName << std::endl;
+        return false;
     }
 
     auto sent = sendto(_socket, buffer, static_cast<int>(packet_length + Protocol::TRANSFER_HEADER), 0,
                        reinterpret_cast<sockaddr*>(&broadcast_address), sizeof(broadcast_address));
     if (sent < 0) {
         std::cerr << "Warning: Failed to send part " << part_index << std::endl;
-        return;
+        return true;
     }
     if (verbose) {
         std::cout << "Part " << part_index << " with size " << packet_length << " was sent" << std::endl;
     }
+    return true;
 }
 
 // Pause between packets to pace the transfer (0 = blast at full speed).
@@ -126,28 +125,12 @@ int openInputFile() {
 }
 
 bool hashInputFile(uint8_t out[32]) {
-    Sha256::Ctx ctx;
-    Sha256::init(ctx);
-    std::vector<char> hash_buf(HASH_BUFFER_SIZE);
-
     input_file.clear();
     input_file.seekg(0, std::ios::beg);
-    size_t total = 0;
-    while (input_file.good()) {
-        input_file.read(hash_buf.data(), static_cast<std::streamsize>(hash_buf.size()));
-        std::streamsize got = input_file.gcount();
-        if (got > 0) {
-            Sha256::update(ctx, reinterpret_cast<const uint8_t*>(hash_buf.data()),
-                           static_cast<size_t>(got));
-            total += static_cast<size_t>(got);
-        }
-        if (got == 0) break;
-    }
-    if (total != file_length) {
+    if (!Sha256::hashStream(input_file, file_length, out)) {
         std::cerr << "Error: Could not hash entire file" << std::endl;
         return false;
     }
-    Sha256::finish(ctx, out);
 
     input_file.clear();
     input_file.seekg(0, std::ios::beg);
@@ -197,9 +180,8 @@ bool sendAnnounce() {
 
 // Serve RESEND requests until ttl expires, re-announcing FINISH periodically.
 // Returns how many parts were re-sent on request.
-size_t serveResends(size_t total_parts) {
+bool serveResends(size_t total_parts, size_t& resent) {
     int64_t lastFinishSendTime = 0;
-    size_t  resent = 0;
 
     SOCKADDR_IN sender_address;
     memset(&sender_address, 0, sizeof(sender_address));
@@ -253,7 +235,7 @@ size_t serveResends(size_t total_parts) {
             if (verbose) {
                 std::cout << "Client requested part of file with index " << part << std::endl;
             }
-            sendPart(part);
+            if (!sendPart(part)) return false;
             ++resent;
         }
         // Re-announce completion at most once a second.
@@ -262,7 +244,7 @@ size_t serveResends(size_t total_parts) {
             sendFinish();
         }
     }
-    return resent;
+    return true;
 }
 
 // Returns a process exit code: 0 on success, non-zero on failure.
@@ -292,7 +274,13 @@ int run() {
     size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
         sent_part.insert({ part_index, 0 });
-        sendPart(part_index);
+        if (!sendPart(part_index)) {
+            reporter.finish();
+            delete[] buffer;
+            buffer = nullptr;
+            input_file.close();
+            return 1;
+        }
         reporter.update(std::min((part_index + 1) * static_cast<size_t>(mtu), file_length));
         pace();
     }
@@ -306,7 +294,13 @@ int run() {
 
     sendFinish();
 
-    size_t resent = serveResends(total_parts);
+    size_t resent = 0;
+    if (!serveResends(total_parts, resent)) {
+        delete[] buffer;
+        buffer = nullptr;
+        input_file.close();
+        return 1;
+    }
     if (resent > 0) {
         std::cout << "Re-sent " << resent << " part(s) on request" << std::endl;
     }

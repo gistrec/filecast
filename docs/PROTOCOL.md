@@ -50,6 +50,11 @@ these 10 bytes.
    it out (atomically, via a temp file and rename) if the digest matches;
    otherwise it reports corruption and fails.
 
+The sender reads the source file from disk when hashing for `ANNOUNCE` and
+again when sending or resending chunks. The source file must remain unchanged
+for the full transfer; a concurrent modification makes the transferred bytes no
+longer match the announced digest.
+
 Because every `TRANSFER` is addressed to the broadcast/multicast group rather
 than to individual receivers, the cost of a transfer does not grow with the
 number of receivers — and a `RESEND` requested by one receiver repairs that
