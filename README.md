@@ -111,8 +111,9 @@ If your platform isn't covered, see
   machines simultaneously
 - **LAN parties** — everyone gets the mod in the time of one transfer
 
-One file per run, up to 4 GiB — the whole file is buffered in RAM on each
-side (see [Limitations](#limitations)).
+One file per run, up to 4 GiB with the current wire format — transfers are
+stored on disk as they arrive, not buffered wholly in RAM (see
+[Limitations](#limitations)).
 
 ## How It Compares
 
@@ -239,15 +240,15 @@ The snapshot is deleted once the file completes and its checksum verifies.
 
 ## Limitations
 
-- The whole file is held in RAM on both sides. The receiver enforces a 4 GiB
-  cap on the announced file size; the sender rejects files that do not fit the
-  4-byte wire size field.
-- `--resume` recovers from Ctrl+C and timeouts (the snapshot is written on exit);
-  a hard kill (SIGKILL) or power loss mid-transfer can still lose the in-flight
-  progress. The snapshot is the whole buffer written synchronously, so
-  interrupting a multi-gigabyte transfer adds a short exit delay while it flushes.
-  The `.part`/`.part.idx` files use stable, predictable names in the working
-  directory, so run the receiver from a directory only you can write to.
+- The v3 wire format stores the file size and part index in 4-byte fields. The
+  receiver enforces a 4 GiB cap on the announced file size; the sender rejects
+  files that do not fit the current wire-size field.
+- Receivers need enough free disk space for the in-progress `.part` file beside
+  the final output. With `--resume`, the `.part` file and its `.part.idx` bitmap
+  are kept after Ctrl+C or a timeout so a later run can continue. A hard kill
+  (SIGKILL) or power loss mid-transfer can still lose the latest unflushed
+  progress. The `.part`/`.part.idx` files use stable, predictable names in the
+  working directory, so run the receiver from a directory only you can write to.
 - No authentication. Any host on the same LAN can announce a transfer and any
   receiver bound to the chosen port will accept it. The SHA-256 check catches
   accidental corruption, not a deliberately crafted stream.

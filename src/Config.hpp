@@ -30,7 +30,6 @@ extern addr_len server_address_length;
 extern addr_len client_address_length;
 
 extern size_t file_length; // File size in bytes
-extern char*  file;        // Pointer to file in RAM
-extern char*  buffer;      // Pointer to buffer
+extern char*  buffer;      // Packet buffer
 
 #endif //FILECAST_CONFIG_H

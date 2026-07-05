@@ -35,10 +35,10 @@ these 10 bytes.
 
 1. The sender broadcasts an `ANNOUNCE` carrying a random session id, the total
    file size, the chunk size, the file's SHA-256, and its name.
-2. Each receiver latches that session, allocates a buffer, and clears its part
-   registry. The chunk size is taken from the announcement, so sender and
-   receivers never disagree about part boundaries even with mismatched `--mtu`
-   settings.
+2. Each receiver latches that session, creates an on-disk `.part` file, and
+   clears its part registry. The chunk size is taken from the announcement, so
+   sender and receivers never disagree about part boundaries even with
+   mismatched `--mtu` settings.
 3. The sender splits the file into chunk-sized pieces and broadcasts each one
    as a `TRANSFER` packet at the configured rate.
 4. The sender broadcasts `FINISH` when all chunks have been sent.

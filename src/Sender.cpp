@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <map>
 #include <random>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -44,6 +45,17 @@ std::string baseName(const std::string& path) {
  * This container contains part number and time when the part was sent
  */
 std::map<size_t, int64_t> sent_part;
+std::ifstream input_file;
+
+constexpr size_t HASH_BUFFER_SIZE = 1024 * 1024;
+
+bool readFileAt(size_t offset, char* out, size_t len) {
+    input_file.clear();
+    input_file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!input_file.good()) return false;
+    input_file.read(out, static_cast<std::streamsize>(len));
+    return static_cast<size_t>(input_file.gcount()) == len;
+}
 
 void sendPart(size_t part_index) {
     size_t offset        = part_index * static_cast<size_t>(mtu);
@@ -53,7 +65,10 @@ void sendPart(size_t part_index) {
     Protocol::writeHeader(buffer, Protocol::Type::Transfer, session_id);
     Protocol::putU32(buffer + Protocol::HEADER_SIZE,     static_cast<uint32_t>(part_index));
     Protocol::putU32(buffer + Protocol::HEADER_SIZE + 4, static_cast<uint32_t>(packet_length));
-    memcpy(buffer + Protocol::TRANSFER_HEADER, file + offset, packet_length);
+    if (!readFileAt(offset, buffer + Protocol::TRANSFER_HEADER, packet_length)) {
+        std::cerr << "Warning: Failed to read part " << part_index << std::endl;
+        return;
+    }
 
     auto sent = sendto(_socket, buffer, static_cast<int>(packet_length + Protocol::TRANSFER_HEADER), 0,
                        reinterpret_cast<sockaddr*>(&broadcast_address), sizeof(broadcast_address));
@@ -80,23 +95,22 @@ void sendFinish() {
     }
 }
 
-// Load the whole file into the global `file` buffer. Returns 0 on success, or
-// an error code after cleaning up the file buffer.
-int loadFileIntoMemory() {
-    std::ifstream input(fileName, std::ios::binary);
-    if (!input.is_open()) {
+// Open the input file and validate the v3 wire-size limit.
+int openInputFile() {
+    input_file.open(fileName, std::ios::binary);
+    if (!input_file.is_open()) {
         std::cerr << "Error: Can't open file " << fileName << std::endl;
         return 1;
     }
 
-    input.seekg(0, std::ios::end);
-    auto end_pos = input.tellg();
+    input_file.seekg(0, std::ios::end);
+    auto end_pos = input_file.tellg();
     if (end_pos < 0) {
         std::cerr << "Error: Can't determine file size" << std::endl;
         return 1;
     }
     file_length = static_cast<size_t>(end_pos);
-    input.seekg(0, std::ios::beg);
+    input_file.seekg(0, std::ios::beg);
 
     if (file_length == 0) {
         std::cerr << "Error: File is empty" << std::endl;
@@ -108,31 +122,47 @@ int loadFileIntoMemory() {
                   << MAX_WIRE_FILE_LENGTH << " bytes" << std::endl;
         return 1;
     }
-
-    file = new (std::nothrow) char[file_length];
-    if (!file) {
-        std::cerr << "Error: Can't allocate " << file_length << " bytes" << std::endl;
-        return 1;
-    }
-    input.read(file, static_cast<std::streamsize>(file_length));
-    if (static_cast<size_t>(input.gcount()) != file_length) {
-        std::cerr << "Error: Could not read entire file" << std::endl;
-        delete[] file;
-        file = nullptr;
-        return 1;
-    }
     return 0;
+}
+
+bool hashInputFile(uint8_t out[32]) {
+    Sha256::Ctx ctx;
+    Sha256::init(ctx);
+    std::vector<char> hash_buf(HASH_BUFFER_SIZE);
+
+    input_file.clear();
+    input_file.seekg(0, std::ios::beg);
+    size_t total = 0;
+    while (input_file.good()) {
+        input_file.read(hash_buf.data(), static_cast<std::streamsize>(hash_buf.size()));
+        std::streamsize got = input_file.gcount();
+        if (got > 0) {
+            Sha256::update(ctx, reinterpret_cast<const uint8_t*>(hash_buf.data()),
+                           static_cast<size_t>(got));
+            total += static_cast<size_t>(got);
+        }
+        if (got == 0) break;
+    }
+    if (total != file_length) {
+        std::cerr << "Error: Could not hash entire file" << std::endl;
+        return false;
+    }
+    Sha256::finish(ctx, out);
+
+    input_file.clear();
+    input_file.seekg(0, std::ios::beg);
+    return true;
 }
 
 // Build and broadcast the ANNOUNCE (retransmitted a few times, since a single
 // drop would strand every receiver and there is no RESEND for it).
-void sendAnnounce() {
+bool sendAnnounce() {
     std::random_device rd;
     session_id = static_cast<uint32_t>(rd());
 
     // Digest of the whole file; the receiver verifies against it after reassembly.
     uint8_t file_hash[32];
-    Sha256::hash(file, file_length, file_hash);
+    if (!hashInputFile(file_hash)) return false;
     if (verbose) std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
 
     // Name the receiver saves under unless it was given an explicit output path.
@@ -162,6 +192,7 @@ void sendAnnounce() {
     if (verbose) {
         std::cout << "Ok: Sent information about new file with size " << file_length << std::endl;
     }
+    return true;
 }
 
 // Serve RESEND requests until ttl expires, re-announcing FINISH periodically.
@@ -238,16 +269,21 @@ size_t serveResends(size_t total_parts) {
 int run() {
     buffer = new char[2 * mtu];
 
-    if (loadFileIntoMemory() != 0) {
+    if (openInputFile() != 0) {
         delete[] buffer;
         buffer = nullptr;
         // The socket is main()'s to close (as on every other return path);
         // closing it here too made main()'s CLOSE_SOCKET a double-close.
         return 1;
     }
-    if (verbose) std::cout << "Ok: File successfully copied to RAM" << std::endl;
+    if (verbose) std::cout << "Ok: File opened for streaming" << std::endl;
 
-    sendAnnounce();
+    if (!sendAnnounce()) {
+        delete[] buffer;
+        buffer = nullptr;
+        input_file.close();
+        return 1;
+    }
 
     const std::string name = baseName(fileName);
     Progress::Reporter reporter;
@@ -277,9 +313,8 @@ int run() {
     if (verbose) std::cout << "Ok: Transfer session ended" << std::endl;
 
     delete[] buffer;
-    delete[] file;
     buffer = nullptr;
-    file   = nullptr;
+    input_file.close();
     return 0;
 }
 

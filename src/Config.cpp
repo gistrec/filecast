@@ -21,5 +21,4 @@ addr_len server_address_length = sizeof(server_address);
 addr_len client_address_length = sizeof(client_address);
 
 size_t file_length = 0;
-char*  file        = nullptr;
 char*  buffer      = nullptr;
