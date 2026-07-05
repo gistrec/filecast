@@ -179,7 +179,7 @@ bool sendAnnounce() {
 }
 
 // Serve RESEND requests until ttl expires, re-announcing FINISH periodically.
-// Returns how many parts were re-sent on request.
+// Returns false on a fatal read error; reports successful re-sends in `resent`.
 bool serveResends(size_t total_parts, size_t& resent) {
     int64_t lastFinishSendTime = 0;
 
