@@ -241,8 +241,8 @@ int run() {
     if (loadFileIntoMemory() != 0) {
         delete[] buffer;
         buffer = nullptr;
-        CLOSE_SOCKET(_socket);
-        CLEANUP_NETWORK();
+        // The socket is main()'s to close (as on every other return path);
+        // closing it here too made main()'s CLOSE_SOCKET a double-close.
         return 1;
     }
     if (verbose) std::cout << "Ok: File successfully copied to RAM" << std::endl;

@@ -205,6 +205,69 @@ run_announced_name_test() {
 }
 run_announced_name_test
 
+# No-clobber: an existing output file must survive a receive without
+# --overwrite (exit 2, byte-identical content, no leftover temp files), and be
+# replaced once --overwrite is given. Pins the no-clobber contract that the
+# atomic finalize (finalizeNoClobber) enforces even against files that appear
+# mid-write.
+run_no_clobber_test() {
+    local dir="$WORKDIR/no-clobber"
+    mkdir -p "$dir"
+    dd if=/dev/urandom of="$dir/src.bin" bs=1024 count=50 status=none
+    echo "precious local data" > "$dir/out.bin"
+    cp "$dir/out.bin" "$dir/expected.bin"
+
+    echo "==> [no-clobber] receive onto an existing file without --overwrite"
+    ( cd "$dir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33411 --port 33412 --ttl 5 --delay-ms 0 > recv1.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/src.bin" --to 127.0.0.1 --bind-port 33412 --port 33411 \
+              --ttl 2 --delay-ms 0 > "$dir/send1.log" 2>&1
+
+    local rc=0
+    wait "$rpid" || rc=$?
+    if [ "$rc" -ne 2 ]; then
+        echo "FAIL: [no-clobber] expected receiver exit 2, got $rc"
+        tail -5 "$dir/recv1.log"
+        return 1
+    fi
+    if ! grep -q "already exists" "$dir/recv1.log"; then
+        echo "FAIL: [no-clobber] missing 'already exists' error"
+        tail -5 "$dir/recv1.log"
+        return 1
+    fi
+    if ! cmp -s "$dir/expected.bin" "$dir/out.bin"; then
+        echo "FAIL: [no-clobber] existing file was modified"
+        return 1
+    fi
+    if ls "$dir"/out.bin.part.* >/dev/null 2>&1; then
+        echo "FAIL: [no-clobber] leftover temp files:"
+        ls "$dir"
+        return 1
+    fi
+
+    echo "==> [no-clobber] same receive with --overwrite replaces the file"
+    ( cd "$dir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33411 --port 33412 --ttl 5 --delay-ms 0 --overwrite \
+          > recv2.log 2>&1 ) &
+    rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/src.bin" --to 127.0.0.1 --bind-port 33412 --port 33411 \
+              --ttl 2 --delay-ms 0 > "$dir/send2.log" 2>&1
+    if ! wait "$rpid"; then
+        echo "FAIL: [no-clobber] receive with --overwrite exited non-zero"
+        tail -5 "$dir/recv2.log"
+        return 1
+    fi
+    if ! cmp -s "$dir/src.bin" "$dir/out.bin"; then
+        echo "FAIL: [no-clobber] --overwrite did not replace the file"
+        return 1
+    fi
+    echo "PASS: [no-clobber] refused without --overwrite, replaced with it"
+}
+run_no_clobber_test
+
 # Resume: interrupt a slow receive with SIGINT, then finish it with --resume.
 # Timing-based, so if no snapshot lands (transfer finished or nothing arrived in
 # the window) it SKIPs; but once a snapshot exists, resume must succeed or FAIL.
