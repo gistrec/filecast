@@ -170,6 +170,37 @@ run_iface_validation() {
 }
 run_iface_validation
 
+# L4 regression: an --mtu whose datagram (chunk + 18-byte header) exceeds the
+# host's UDP send limit must be rejected up front, never reported as a successful
+# (but silently truncated) transfer. macOS/BSD cap outbound datagrams at
+# net.inet.udp.maxdgram (~9216); elsewhere the 65507 IPv4 ceiling applies and the
+# static --mtu cap (65489) bites. Pure validation, so it runs everywhere.
+run_mtu_datagram_limit_test() {
+    local f="$WORKDIR/mtu-src.bin"
+    echo "mtu-test" > "$f"
+    local out=0 err header=18 limit
+    limit="$(sysctl -n net.inet.udp.maxdgram 2>/dev/null || echo 65507)"
+    local too_big=$(( limit - header + 1 ))                       # datagram = limit + 1
+    local deliverable=$(( (limit < 65507 ? limit : 65507) - header ))
+
+    # Oversized: must fail loudly with an --mtu error, never print "Sent ".
+    err="$("$BINARY" send "$f" --to 127.0.0.1 --ttl 1 --delay-ms 0 --mtu "$too_big" 2>&1 || true)"
+    if grep -q "Sent " <<<"$err"; then
+        echo "FAIL: [mtu-limit] oversized --mtu $too_big (datagram $((too_big+header)) > $limit) reported success"; out=1
+    elif ! grep -q -- "--mtu" <<<"$err"; then
+        echo "FAIL: [mtu-limit] oversized --mtu $too_big rejected without an --mtu error: $err"; out=1
+    fi
+
+    # Largest deliverable --mtu must still be accepted.
+    if ! "$BINARY" send "$f" --to 127.0.0.1 --ttl 1 --delay-ms 0 --mtu "$deliverable" >/dev/null 2>&1; then
+        echo "FAIL: [mtu-limit] largest deliverable --mtu $deliverable was rejected"; out=1
+    fi
+
+    [ "$out" -eq 0 ] && echo "PASS: [mtu-limit] oversized --mtu rejected, deliverable --mtu accepted"
+    return "$out"
+}
+run_mtu_datagram_limit_test
+
 # Announced-name delivery: run `receive` with NO output path, so the file must
 # be saved under the name carried in the ANNOUNCE. This is the only test that
 # exercises the name_len/name wire fields — every other case passes an explicit
