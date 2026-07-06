@@ -378,6 +378,42 @@ run_timeout_no_sender_test() {
 }
 run_timeout_no_sender_test
 
+# Pre-planted hardlink: O_NOFOLLOW blocks a symlink but not a hardlink, so a
+# local attacker who can write the cwd could hardlink the predictable <name>.part
+# onto a victim file and have the receiver's truncate/writes corrupt it. Plant
+# such a hardlink and assert the receiver refuses (non-zero exit) and leaves the
+# victim's contents byte-for-byte intact.
+run_hardlink_part_test() {
+    local dir="$WORKDIR/hardlink-part"
+    mkdir -p "$dir"
+    dd if=/dev/urandom of="$dir/src.bin" bs=1024 count=50 status=none
+    printf 'precious victim data that must not be truncated' > "$dir/victim"
+    cp "$dir/victim" "$dir/victim.expected"
+    ln "$dir/victim" "$dir/out.bin.part"   # hardlink at the predictable .part name
+
+    echo "==> [hardlink] receive with a hardlinked out.bin.part planted"
+    local rc=0
+    ( cd "$dir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33417 --port 33418 --ttl 5 --delay-ms 0 > recv.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/src.bin" --to 127.0.0.1 --bind-port 33418 --port 33417 \
+              --ttl 2 --delay-ms 0 > "$dir/send.log" 2>&1 || true
+    wait "$rpid" || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: [hardlink] receiver accepted a hardlinked .part (exit 0)"
+        tail -5 "$dir/recv.log"
+        return 1
+    fi
+    if ! cmp -s "$dir/victim.expected" "$dir/victim"; then
+        echo "FAIL: [hardlink] victim file was corrupted through the hardlink"
+        return 1
+    fi
+    echo "PASS: [hardlink] refused the pre-planted hardlink, victim intact"
+}
+run_hardlink_part_test
+
 # Many parts: a tiny MTU splits even a small file into hundreds of parts, so this
 # drives the received-parts bitmap (set/has/count) across a large index range and
 # checks reassembly stays byte-exact. The bitmap replaced an std::set that scaled

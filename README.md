@@ -252,7 +252,9 @@ The snapshot is deleted once the file completes and its checksum verifies.
   are kept after Ctrl+C or a timeout so a later run can continue. A hard kill
   (SIGKILL) or power loss mid-transfer can still lose the latest unflushed
   progress. The `.part`/`.part.idx` files use stable, predictable names in the
-  working directory, so run the receiver from a directory only you can write to.
+  working directory. The receiver refuses to write through a symlink or a
+  pre-planted hardlink at those names, but still run it from a directory only
+  you can write to.
 - No authentication. Any host on the same LAN can announce a transfer and any
   receiver bound to the chosen port will accept it. The SHA-256 check catches
   accidental corruption, not a deliberately crafted stream.
