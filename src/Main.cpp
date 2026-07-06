@@ -1,5 +1,6 @@
 #include "cxxopts.hpp"
 #include "Config.hpp"
+#include "Protocol.hpp"
 
 #include <iostream>
 #include <ostream>
@@ -120,8 +121,10 @@ Command pickCommand(int argc, char* argv[], cxxopts::Options& options, int& exit
 
 // Validate the numeric flags. Prints and returns false on the first bad value.
 bool validateNumericFlags(const CliOptions& opt) {
-    if (opt.mtu < 64 || opt.mtu > 65507) {
-        std::cerr << "Error: --mtu must be between 64 and 65507" << std::endl;
+    if (opt.mtu < static_cast<int>(Protocol::MIN_CHUNK) ||
+        opt.mtu > static_cast<int>(Protocol::MAX_CHUNK)) {
+        std::cerr << "Error: --mtu must be between " << Protocol::MIN_CHUNK
+                  << " and " << Protocol::MAX_CHUNK << std::endl;
         return false;
     }
     if (opt.ttl <= 0) {

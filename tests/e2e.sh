@@ -170,6 +170,37 @@ run_iface_validation() {
 }
 run_iface_validation
 
+# L4 regression: an --mtu whose datagram (chunk + 18-byte header) exceeds the
+# host's UDP send limit must be rejected up front, never reported as a successful
+# (but silently truncated) transfer. macOS/BSD cap outbound datagrams at
+# net.inet.udp.maxdgram (~9216); elsewhere the 65507 IPv4 ceiling applies and the
+# static --mtu cap (65489) bites. Pure validation, so it runs everywhere.
+run_mtu_datagram_limit_test() {
+    local f="$WORKDIR/mtu-src.bin"
+    echo "mtu-test" > "$f"
+    local out=0 err header=18 limit
+    limit="$(sysctl -n net.inet.udp.maxdgram 2>/dev/null || echo 65507)"
+    local too_big=$(( limit - header + 1 ))                       # datagram = limit + 1
+    local deliverable=$(( (limit < 65507 ? limit : 65507) - header ))
+
+    # Oversized: must fail loudly with an --mtu error, never print "Sent ".
+    err="$("$BINARY" send "$f" --to 127.0.0.1 --ttl 1 --delay-ms 0 --mtu "$too_big" 2>&1 || true)"
+    if grep -q "Sent " <<<"$err"; then
+        echo "FAIL: [mtu-limit] oversized --mtu $too_big (datagram $((too_big+header)) > $limit) reported success"; out=1
+    elif ! grep -q -- "--mtu" <<<"$err"; then
+        echo "FAIL: [mtu-limit] oversized --mtu $too_big rejected without an --mtu error: $err"; out=1
+    fi
+
+    # Largest deliverable --mtu must still be accepted.
+    if ! "$BINARY" send "$f" --to 127.0.0.1 --ttl 1 --delay-ms 0 --mtu "$deliverable" >/dev/null 2>&1; then
+        echo "FAIL: [mtu-limit] largest deliverable --mtu $deliverable was rejected"; out=1
+    fi
+
+    [ "$out" -eq 0 ] && echo "PASS: [mtu-limit] oversized --mtu rejected, deliverable --mtu accepted"
+    return "$out"
+}
+run_mtu_datagram_limit_test
+
 # Announced-name delivery: run `receive` with NO output path, so the file must
 # be saved under the name carried in the ANNOUNCE. This is the only test that
 # exercises the name_len/name wire fields — every other case passes an explicit
@@ -346,6 +377,42 @@ run_timeout_no_sender_test() {
     echo "PASS: [no-sender] timeout before ANNOUNCE left the cwd untouched"
 }
 run_timeout_no_sender_test
+
+# Pre-planted hardlink: O_NOFOLLOW blocks a symlink but not a hardlink, so a
+# local attacker who can write the cwd could hardlink the predictable <name>.part
+# onto a victim file and have the receiver's truncate/writes corrupt it. Plant
+# such a hardlink and assert the receiver refuses (non-zero exit) and leaves the
+# victim's contents byte-for-byte intact.
+run_hardlink_part_test() {
+    local dir="$WORKDIR/hardlink-part"
+    mkdir -p "$dir"
+    dd if=/dev/urandom of="$dir/src.bin" bs=1024 count=50 status=none
+    printf 'precious victim data that must not be truncated' > "$dir/victim"
+    cp "$dir/victim" "$dir/victim.expected"
+    ln "$dir/victim" "$dir/out.bin.part"   # hardlink at the predictable .part name
+
+    echo "==> [hardlink] receive with a hardlinked out.bin.part planted"
+    local rc=0
+    ( cd "$dir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33417 --port 33418 --ttl 5 --delay-ms 0 > recv.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/src.bin" --to 127.0.0.1 --bind-port 33418 --port 33417 \
+              --ttl 2 --delay-ms 0 > "$dir/send.log" 2>&1 || true
+    wait "$rpid" || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: [hardlink] receiver accepted a hardlinked .part (exit 0)"
+        tail -5 "$dir/recv.log"
+        return 1
+    fi
+    if ! cmp -s "$dir/victim.expected" "$dir/victim"; then
+        echo "FAIL: [hardlink] victim file was corrupted through the hardlink"
+        return 1
+    fi
+    echo "PASS: [hardlink] refused the pre-planted hardlink, victim intact"
+}
+run_hardlink_part_test
 
 # Many parts: a tiny MTU splits even a small file into hundreds of parts, so this
 # drives the received-parts bitmap (set/has/count) across a large index range and

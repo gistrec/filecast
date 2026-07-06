@@ -9,13 +9,17 @@
 #include <thread>
 #include <chrono>
 #include <cstring>
-#include <cerrno>
 #include <cstdio>
 #include <cstdint>
 #include <string>
 #include <algorithm>
 #include <map>
 #include <random>
+#include <cerrno>
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#include <sys/sysctl.h>
+#endif
 
 using namespace std::chrono_literals;
 
@@ -73,10 +77,25 @@ bool sendPart(size_t part_index, bool* delivered = nullptr, int* send_errno = nu
         return false;
     }
 
-    auto sent = sendto(_socket, buffer, static_cast<int>(packet_length + Protocol::TRANSFER_HEADER), 0,
+    size_t datagram = packet_length + Protocol::TRANSFER_HEADER;
+    auto sent = sendto(_socket, buffer, static_cast<int>(datagram), 0,
                        reinterpret_cast<sockaddr*>(&broadcast_address), sizeof(broadcast_address));
     if (sent < 0) {
         if (send_errno) *send_errno = errno;
+        // EMSGSIZE is permanent (the datagram is too big for this host's UDP
+        // stack); RESEND would loop forever, so fail loudly instead of a silent
+        // broken transfer. Other errors are transient and recoverable via RESEND.
+#if defined(_WIN32) || defined(_WIN64)
+        bool too_big = (WSAGetLastError() == WSAEMSGSIZE);
+#else
+        bool too_big = (errno == EMSGSIZE);
+#endif
+        if (too_big) {
+            std::cerr << "Error: part " << part_index << " needs a " << datagram
+                      << "-byte datagram, over this system's UDP send limit; lower --mtu"
+                      << std::endl;
+            return false;
+        }
         std::cerr << "Warning: Failed to send part " << part_index << std::endl;
         return true;
     }
@@ -265,8 +284,35 @@ bool serveResends(size_t total_parts, size_t& resent) {
     return true;
 }
 
+// Largest UDP datagram this host will actually send. macOS/BSD cap outbound
+// datagrams at net.inet.udp.maxdgram (default 9216); elsewhere the IPv4 payload
+// ceiling applies. Sending past this fails with EMSGSIZE.
+size_t maxSendDatagram() {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    int val = 0;
+    size_t len = sizeof(val);
+    if (sysctlbyname("net.inet.udp.maxdgram", &val, &len, nullptr, 0) == 0 && val > 0) {
+        return static_cast<size_t>(val);
+    }
+#endif
+    return Protocol::MAX_UDP_PAYLOAD;
+}
+
 // Returns a process exit code: 0 on success, non-zero on failure.
 int run() {
+    // Reject an --mtu whose datagram the OS won't send before we hash the whole
+    // file. --mtu passes the static IPv4 cap (65489) but a host may allow less.
+    size_t max_dgram = maxSendDatagram();
+    if (static_cast<size_t>(mtu) + Protocol::TRANSFER_HEADER > max_dgram) {
+        size_t max_mtu = (max_dgram > Protocol::TRANSFER_HEADER)
+                       ? max_dgram - Protocol::TRANSFER_HEADER : 0;
+        std::cerr << "Error: --mtu " << mtu << " needs a "
+                  << (static_cast<size_t>(mtu) + Protocol::TRANSFER_HEADER)
+                  << "-byte datagram, over this system's UDP send limit of " << max_dgram
+                  << "; use --mtu <= " << max_mtu << std::endl;
+        return 1;
+    }
+
     buffer = new char[2 * mtu];
 
     if (openInputFile() != 0) {
