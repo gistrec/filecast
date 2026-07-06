@@ -56,12 +56,12 @@ static ssize_t injected_pwrite(int fd, const void* buf, size_t count, off_t offs
 /*
  * macOS uses two-level namespaces, so a plain symbol override is ignored; the
  * __interpose section remaps callers of pwrite() to injected_pwrite() instead
- * (no DYLD_FORCE_FLAT_NAMESPACE needed).
+ * (no DYLD_FORCE_FLAT_NAMESPACE needed). An __interpose entry is just the pair
+ * {replacement, original}; a 2-element pointer array matches that layout and,
+ * unlike a named struct, gives static analysers no "unused member" to flag.
  */
-__attribute__((used)) static struct {
-    const void* replacement;
-    const void* original;
-} interpose_pwrite __attribute__((section("__DATA,__interpose"))) = {
+__attribute__((used, section("__DATA,__interpose")))
+static const void* interpose_pwrite[2] = {
     (const void*)&injected_pwrite,
     (const void*)&pwrite,
 };

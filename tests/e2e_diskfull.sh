@@ -43,6 +43,13 @@ case "$(uname -s)" in
     *)      PRELOAD_VAR="LD_PRELOAD" ;;
 esac
 
+# A binary built with AddressSanitizer (the sanitizer CI job) aborts on startup
+# when an interceptor shim is LD_PRELOADed ahead of the ASan runtime ("runtime
+# does not come first"). verify_asan_link_order=0 waives just that check while
+# keeping every other ASan check active. Appended to any ASAN_OPTIONS the job
+# already set, and ignored entirely by non-ASan builds.
+RECV_ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}verify_asan_link_order=0"
+
 WORKDIR="$(mktemp -d -t fb-e2e-diskfull.XXXXXX)"
 RECV_PID=""
 SEND_PID=""
@@ -81,7 +88,7 @@ run_diskfull_test() {
     echo "==> [$label] starting receiver (${extra_flag:-plain}) with pwrite->ENOSPC shim"
     # Absolute output path keeps the .part/.part.idx artifacts inside $dir. The
     # preload var is prefixed onto the receiver command only.
-    env "$PRELOAD_VAR=$FAILLIB" FAILPWRITE_AFTER=0 \
+    env "$PRELOAD_VAR=$FAILLIB" ASAN_OPTIONS="$RECV_ASAN_OPTIONS" FAILPWRITE_AFTER=0 \
         "$BINARY" receive "$dir/out.bin" --to 127.0.0.1 \
                   --bind-port "$RECV_BIND" --port "$SEND_BIND" \
                   --ttl 10 --delay-ms 0 ${extra[@]+"${extra[@]}"} > "$recv_log" 2>&1 &
