@@ -91,6 +91,22 @@ if(BUILD_TESTING)
             TIMEOUT 120
         )
 
+        # Durable-sync-failure variant: a sibling C shim forces the receiver's
+        # fsync() to fail with EIO, so a completed transfer's durable sync fails
+        # while the page-cache re-read still passes — pinning that verifyAndWrite
+        # never reports "sha256 verified" for un-synced data. Linux only (the
+        # e2e_syncfail.sh script self-skips elsewhere; see its header).
+        add_library(failsync SHARED tests/failsync.c)
+
+        add_test(
+            NAME e2e_syncfail
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_syncfail.sh
+        )
+        set_tests_properties(e2e_syncfail PROPERTIES
+            ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;FAILLIB=$<TARGET_FILE:failsync>"
+            TIMEOUT 120
+        )
+
         # Lossy variant: a Python UDP proxy drops packets in both directions to
         # exercise the RESEND recovery branch. Skipped if Python 3 is missing.
         find_package(Python3 COMPONENTS Interpreter QUIET)

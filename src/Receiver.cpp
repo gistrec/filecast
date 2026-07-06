@@ -119,17 +119,24 @@ std::string snapshotPartPath() {
     return fileName + ".part";
 }
 
-void closePartFile(bool flush) {
+// Close the part file, optionally flushing to stable storage first. Returns true
+// only when the requested flush AND the close both succeed — a failed durable
+// sync means the bytes may never reach disk. The handle is always released.
+bool closePartFile(bool flush) {
     #if defined(_WIN32) || defined(_WIN64)
-    if (part_handle == INVALID_HANDLE_VALUE) return;
-    if (flush) FlushFileBuffers(part_handle);
-    CloseHandle(part_handle);
+    if (part_handle == INVALID_HANDLE_VALUE) return true;
+    bool ok = true;
+    if (flush && !FlushFileBuffers(part_handle)) ok = false;
+    if (!CloseHandle(part_handle)) ok = false;
     part_handle = INVALID_HANDLE_VALUE;
+    return ok;
     #else
-    if (part_fd < 0) return;
-    if (flush) durableSync(part_fd);
-    close(part_fd);
+    if (part_fd < 0) return true;
+    bool ok = true;
+    if (flush && durableSync(part_fd) != 0) ok = false;
+    if (close(part_fd) != 0) ok = false;
     part_fd = -1;
+    return ok;
     #endif
 }
 
@@ -216,8 +223,10 @@ bool writePartAt(size_t offset, const char* data, size_t len) {
     #endif
 }
 
+// Hash the received .part file back to compare against the announced digest. The
+// caller must have already flushed and closed it (verifyAndWrite does): a fresh
+// read handle is served from the page cache, so a failed sync can't be seen here.
 bool hashPartFile(uint8_t out[32]) {
-    closePartFile(true);
     std::ifstream in(part_path, std::ifstream::binary);
     if (!in.is_open()) return false;
     return Sha256::hashStream(in, file_length, out);
@@ -367,10 +376,9 @@ Finalize finalizeNoClobber(const std::string& tmp, const std::string& target) {
     #endif
 }
 
-// Move the verified on-disk .part file into place. On failure the .part file is
-// kept so the user does not lose a completed transfer.
+// Move the verified on-disk .part file into place; the caller already flushed and
+// closed it. On failure the .part file is kept so the user does not lose it.
 int finalizeVerifiedPart(const std::string& target) {
-    closePartFile(true);
     if (overwrite) {
         if (finalizeReplace(part_path, target)) {
             storage_ready = false;
@@ -468,7 +476,9 @@ constexpr size_t SNAPSHOT_HEADER = 51;
 // (nor pays the synchronous whole-buffer write) when interrupted.
 bool saveSnapshot() {
     if (!resume || !storage_ready || !have_session) return false;
-    closePartFile(true);
+    // A failed flush leaves the .part unreliable, so don't advertise a snapshot a
+    // later --resume would trust with parts that never durably landed.
+    if (!closePartFile(true)) return false;
     size_t total = totalParts();
     size_t bmSize = (total + 7) / 8;
     std::vector<char> idx(SNAPSHOT_HEADER + bmSize, 0);
@@ -565,6 +575,16 @@ int onRecoveryTimeout(size_t missing) {
 // Returns a process exit code.
 int verifyAndWrite() {
     reporter.finish();
+
+    // Flush to stable storage before trusting the bytes: the checksum below is
+    // served from the page cache, so a failed durable sync would otherwise pass
+    // as "sha256 verified" on data that never reached the disk.
+    if (!closePartFile(true)) {
+        std::cerr << "Error: Failed to flush received data to disk" << std::endl;
+        if (resume) discardSnapshot();
+        else removePartFiles();
+        return 2;
+    }
 
     uint8_t got[32];
     if (!hashPartFile(got)) {
