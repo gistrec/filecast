@@ -119,7 +119,9 @@ constexpr size_t MAX_CHUNK = MAX_UDP_PAYLOAD - TRANSFER_HEADER;  // 65489
 
 inline size_t totalParts(size_t file_length, size_t chunk_size) {
     if (chunk_size == 0) return 0;  // guard the reusable helper against misuse
-    return (file_length + chunk_size - 1) / chunk_size;
+    // Overflow-safe ceiling division: file_length + chunk_size - 1 would wrap a
+    // 32-bit size_t near the 0xFFFFFFFF wire limit and collapse the count to ~0.
+    return file_length / chunk_size + (file_length % chunk_size != 0 ? 1 : 0);
 }
 
 // Expected payload size of `part`: the full chunk for every part but the last,

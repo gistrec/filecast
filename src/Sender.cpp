@@ -362,7 +362,9 @@ int run() {
     Progress::Reporter reporter;
     reporter.start("Sending " + name, file_length, verbose);
 
-    size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
+    // Route through the shared helper so the count stays overflow-safe at the
+    // 0xFFFFFFFF wire limit (a raw file_length + mtu - 1 wraps a 32-bit size_t).
+    size_t total_parts = Protocol::totalParts(file_length, static_cast<size_t>(mtu));
     size_t delivered_parts = 0;
     int send_errno = 0;
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
