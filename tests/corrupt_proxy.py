@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Corrupting UDP proxy for exercising the checksum-mismatch branch on loopback.
+"""
+Corrupting UDP proxy for exercising the checksum-mismatch branch on loopback.
 
 Like lossy_proxy.py this runs two unidirectional proxies in one process:
 

@@ -50,7 +50,7 @@ bool readFileAt(size_t offset, char* out, size_t len) {
     input_file.clear();
     input_file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!input_file.good()) return false;
-    input_file.read(out, static_cast<std::streamsize>(len));
+    input_file.read(out, static_cast<std::streamsize>(len));  // Flawfinder: ignore (out sized to len by caller)
     return static_cast<size_t>(input_file.gcount()) == len;
 }
 

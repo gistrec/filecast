@@ -40,9 +40,9 @@ RECV_PID=""
 SEND_PID=""
 
 cleanup() {
-    [ -n "$RECV_PID"  ] && kill "$RECV_PID"  2>/dev/null || true
-    [ -n "$SEND_PID"  ] && kill "$SEND_PID"  2>/dev/null || true
-    [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
+    if [ -n "$RECV_PID"  ]; then kill "$RECV_PID"  2>/dev/null || true; fi
+    if [ -n "$SEND_PID"  ]; then kill "$SEND_PID"  2>/dev/null || true; fi
+    if [ -n "$PROXY_PID" ]; then kill "$PROXY_PID" 2>/dev/null || true; fi
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT

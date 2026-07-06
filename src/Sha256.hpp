@@ -131,7 +131,7 @@ inline bool hashStream(std::istream& in, size_t expected_len, uint8_t out[32],
     size_t total = 0;
 
     while (in.good()) {
-        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));  // Flawfinder: ignore (buf sized to buffer_size)
         std::streamsize got = in.gcount();
         if (got > 0) {
             update(c, reinterpret_cast<const uint8_t*>(buf.data()), static_cast<size_t>(got));
