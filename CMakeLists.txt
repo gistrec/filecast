@@ -73,6 +73,24 @@ if(BUILD_TESTING)
             ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>"
         )
 
+        # Disk-full variant: a tiny C shim (LD_PRELOAD / DYLD_INSERT_LIBRARIES)
+        # forces the receiver's first pwrite() to fail with ENOSPC, exercising
+        # the write-failure cleanup branch without a real full filesystem. The
+        # shim is C so the sanitizer job (which overrides CMAKE_CXX_FLAGS only)
+        # leaves it uninstrumented and it preloads cleanly into the receiver.
+        enable_language(C)
+        add_library(failpwrite SHARED tests/failpwrite.c)
+        target_link_libraries(failpwrite PRIVATE ${CMAKE_DL_LIBS})
+
+        add_test(
+            NAME e2e_diskfull
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_diskfull.sh
+        )
+        set_tests_properties(e2e_diskfull PROPERTIES
+            ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;FAILLIB=$<TARGET_FILE:failpwrite>"
+            TIMEOUT 120
+        )
+
         # Lossy variant: a Python UDP proxy drops packets in both directions to
         # exercise the RESEND recovery branch. Skipped if Python 3 is missing.
         find_package(Python3 COMPONENTS Interpreter QUIET)
