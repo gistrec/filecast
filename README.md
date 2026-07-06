@@ -149,7 +149,7 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 | `--iface`     | system-chosen | IPv4 | Multicast interface — the local NIC's IPv4 to send/receive the group on (`--multicast` only) |
 | `-p, --port`  | `33333`    | 1..65535 | Destination port for outgoing packets |
 | `--bind-port` | `33333`    | 1..65535 | Local port to bind on |
-| `--mtu`       | `1500`     | 64..65507 | Max packet size in bytes |
+| `--mtu`       | `1500`     | 64..65489 | Max packet size in bytes (18-byte header keeps the datagram within the 65507-byte UDP limit) |
 | `--ttl`       | `15`       | > 0 | Seconds of silence before giving up |
 | `--rate`      | `100`      | > 0 | Target send rate in Mbit/s |
 | `--overwrite` | off        | — | Overwrite an existing output file |
