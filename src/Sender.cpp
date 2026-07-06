@@ -215,16 +215,32 @@ bool sendAnnounce() {
     return true;
 }
 
-// Serve RESEND requests until ttl expires, re-announcing FINISH periodically.
-// Returns false on a fatal read error; reports successful re-sends in `resent`.
+// Absolute ceiling on the whole resend-serving phase, expressed as a multiple of
+// ttl_max. The idle ttl already ends the phase once RESEND requests stop; this is
+// a backstop for a peer (buggy or hostile) that keeps sending valid RESENDs, each
+// of which refreshes ttl and would otherwise keep the sender re-reading the file
+// from disk and re-broadcasting parts without end. It is generous enough for any
+// real LAN recovery yet keeps a single sender run bounded.
+constexpr int RESEND_PHASE_TTL_MULTIPLE = 10;
+
+// Serve RESEND requests until ttl expires or the absolute phase deadline is hit,
+// re-announcing FINISH periodically. Returns false on a fatal read error; reports
+// successful re-sends in `resent`.
 bool serveResends(size_t total_parts, size_t& resent) {
     int64_t lastFinishSendTime = 0;
+
+    // Fixed at phase start and never extended by incoming traffic, so it is always
+    // reached even under a continuous RESEND flood (which keeps recvfrom busy, so
+    // the idle ttl below never counts down). Steady clock, so a wall-clock jump
+    // cannot stretch or collapse it.
+    const auto phase_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(static_cast<int64_t>(ttl_max) * RESEND_PHASE_TTL_MULTIPLE);
 
     SOCKADDR_IN sender_address;
     memset(&sender_address, 0, sizeof(sender_address));
     addr_len sender_address_length = sizeof(sender_address);
 
-    while (ttl) {
+    while (ttl && std::chrono::steady_clock::now() < phase_deadline) {
         // Read into the full buffer (2 * mtu). The socket is bound to the same
         // port we broadcast to, so the OS also delivers copies of our own
         // TRANSFER packets here; on Windows a 100-byte buffer made those
@@ -265,15 +281,21 @@ bool serveResends(size_t total_parts, size_t& resent) {
         auto epoch    = std::chrono::system_clock::now().time_since_epoch();
         int64_t duration = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
 
-        ttl = ttl_max;
-
-        if (duration - sent_part[part] >= 1) {
+        // Rate-limit re-sends to one per part per second. find() rather than
+        // operator[] so merely being asked about a part we won't re-send this
+        // second does not insert a map node. ttl is refreshed only when a part is
+        // actually re-sent, so a flood of RESENDs for a part already served this
+        // second cannot keep the phase alive without any real work being done —
+        // the absolute deadline above is then what ends it.
+        auto it = sent_part.find(part);
+        if (it == sent_part.end() || duration - it->second >= 1) {
             sent_part[part] = duration;
             if (verbose) {
                 std::cout << "Client requested part of file with index " << part << std::endl;
             }
             if (!sendPart(part)) return false;
             ++resent;
+            ttl = ttl_max;
         }
         // Re-announce completion at most once a second.
         if (duration - lastFinishSendTime >= 1) {

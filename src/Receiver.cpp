@@ -59,6 +59,23 @@ bool     have_session = false;
 // mismatch no longer live-locks the transfer.
 size_t chunk_size = 0;
 
+// Wall-clock deadline for the current wait, refreshed only by a recognised packet
+// from our sender (ANNOUNCE/TRANSFER/FINISH for our session). Deciding the timeout
+// on elapsed real time — rather than on how long a single recvfrom sat idle — is
+// what keeps it reachable: a host that floods the socket with junk faster than the
+// 1s SO_RCVTIMEO never lets recvfrom report an idle read, but junk never pushes
+// this deadline either, so the receiver still gives up ttl_max seconds after the
+// last real packet. Steady clock, so a system-time jump cannot move it.
+std::chrono::steady_clock::time_point receive_deadline;
+
+void refreshDeadline() {
+    receive_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(ttl_max);
+}
+
+bool deadlineExpired() {
+    return std::chrono::steady_clock::now() >= receive_deadline;
+}
+
 // A packet with our magic but a foreign protocol version is dropped; report it
 // once per run so a version-mixed LAN is diagnosable without a warning storm.
 void warnVersionOnce(uint8_t seen) {
@@ -666,7 +683,12 @@ int checkParts() {
 
     size_t total = totalParts();
 
-    while (ttl && parts.size() < total) {
+    // Wall-clock deadline (refreshed only by a recovered part), so a junk flood
+    // that keeps recvfrom busy can't freeze recovery the way a per-round counter
+    // would. Recovery still gives up ttl_max seconds after the last real part.
+    refreshDeadline();
+
+    while (!deadlineExpired() && parts.size() < total) {
         if (g_interrupted) return onInterrupt(buffer);
         // Re-request every still-missing part. Walking the bitmap in place avoids
         // materialising a full missing-parts vector, which for a 67M-part file
@@ -691,8 +713,12 @@ int checkParts() {
         memset(&sender_address, 0, sizeof(sender_address));
         addr_len sender_address_length = sizeof(sender_address);
 
-        bool progressed = false;
         while (true) {
+            // Bail on Ctrl+C or the deadline before each read, so a junk flood
+            // that keeps recvfrom busy can't spin the drain loop forever.
+            if (g_interrupted) return onInterrupt(buffer);
+            if (deadlineExpired()) break;
+
             auto length = recvfrom(_socket, buffer, static_cast<int>(bufcap), 0,
                                    reinterpret_cast<sockaddr*>(&sender_address),
                                    &sender_address_length);
@@ -707,19 +733,15 @@ int checkParts() {
                 warnVersionOnce(h.version);
                 continue;
             }
-            if (handleTransfer(buffer, static_cast<int64_t>(length))) progressed = true;
+            // Only a recovered part pushes the deadline; junk and our own
+            // looped-back RESENDs don't, so recovery still terminates.
+            if (handleTransfer(buffer, static_cast<int64_t>(length))) refreshDeadline();
             if (storage_failed) {
                 delete[] buffer;
                 if (!resume) removePartFiles();
                 return 2;
             }
         }
-
-        // A new part refreshes ttl; a round with no progress counts down toward
-        // the timeout. Our own looped-back RESENDs are not TRANSFERs, so a dead
-        // sender still lets recovery terminate instead of livelocking.
-        if (progressed) ttl = ttl_max;
-        else            ttl--;
     }
 
     delete[] buffer;
@@ -814,9 +836,9 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
     if (static_cast<size_t>(length) < Protocol::ANNOUNCE_FIXED + name_len) return true;  // truncated
 
     // Storage open means we are committed to this session's file. Drop a differing
-    // same-session ANNOUNCE before announceValid() and the ttl refresh, so a forged
+    // same-session ANNOUNCE before announceValid() and the deadline refresh, so a forged
     // empty/oversized one can neither fail validation and kill the receiver nor
-    // hold it open. A matching one just refreshes ttl; a restart draws a new session.
+    // hold it open. A matching one just pushes the deadline out; a restart draws a new session.
     if (storage_ready) {
         bool same = announced == file_length && incoming_cs == chunk_size &&
                     memcmp(expected_hash, buf + Protocol::HEADER_SIZE + 8, 32) == 0;
@@ -825,15 +847,15 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
                       << std::endl;
             return true;
         }
-        ttl = ttl_max;
+        refreshDeadline();
         return true;
     }
 
-    // Only a recognised packet from our sender refreshes ttl. Unrecognised
+    // Only a recognised packet from our sender pushes the timeout out. Unrecognised
     // traffic (stray broadcasts, other receivers' RESENDs, garbage) deliberately
-    // does not, so the timeout stays reachable and a hostile or noisy host cannot
+    // does not, so the deadline stays reachable and a hostile or noisy host cannot
     // keep the receiver alive forever.
-    ttl = ttl_max;
+    refreshDeadline();
 
     if (!announceValid(announced, incoming_cs, exit_code)) return false;
 
@@ -869,7 +891,7 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
 // ANNOUNCE (a one-packet unauthenticated DoS).
 void handleFinish(uint32_t incoming_sid, bool& finish) {
     if (!have_session || incoming_sid != session_id) return;
-    ttl = ttl_max;
+    refreshDeadline();
     if (!finish) {
         if (verbose) std::cout << "Server finished transferring" << std::endl;
         finish = true;
@@ -898,7 +920,7 @@ int dispatchPacket(char*& buf, size_t& bufcap, int64_t length, bool& finish) {
             break;
         }
         case Protocol::Type::Transfer:
-            if (storage_ready && handleTransfer(buf, length)) ttl = ttl_max;
+            if (storage_ready && handleTransfer(buf, length)) refreshDeadline();
             if (storage_failed) return 2;
             break;
         case Protocol::Type::Finish:
@@ -926,7 +948,8 @@ int run() {
         std::cerr << "Waiting for a sender... (Ctrl+C to cancel)" << std::endl;
     }
 
-    while (ttl > 0) {
+    refreshDeadline();
+    while (!deadlineExpired()) {
         if (g_interrupted) return onInterrupt(buffer);
         // Sender finished transferring — move to the recovery phase (or bail if
         // we joined too late to ever have received the ANNOUNCE).
@@ -944,9 +967,10 @@ int run() {
                                reinterpret_cast<sockaddr*>(&server_address),
                                &server_address_length);
 
-        // Timeout (SO_RCVTIMEO) or socket error: count down toward giving up.
+        // Timeout (SO_RCVTIMEO) or socket error: nothing to process this round. The
+        // wall-clock deadline — not this idle tick — decides when to give up, so a
+        // socket kept busy with junk can no longer starve the countdown.
         if (length < 0) {
-            ttl--;
             continue;
         }
         // A zero-length datagram is a valid UDP event; ignore it. Using the
@@ -963,9 +987,9 @@ int run() {
             return code;
         }
     }
-    // A Ctrl+C that landed exactly as ttl hit 0 skips the top-of-loop check
-    // (recvfrom's ttl-- dropped ttl to 0 and the while guard exited first), so
-    // re-check here to still take the interrupt path (snapshot + exit 130).
+    // A Ctrl+C that landed exactly as the deadline expired skips the top-of-loop
+    // check (the while guard saw the deadline first), so re-check here to still
+    // take the interrupt path (snapshot + exit 130).
     if (g_interrupted) return onInterrupt(buffer);
 
     // ttl exhausted before FINISH: the transfer did not complete.

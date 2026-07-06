@@ -160,8 +160,21 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # Flood variant: a Python UDP flooder keeps the socket busy so
+            # recvfrom never reports an idle read, pinning that the receiver's
+            # wait and the sender's resend phase now time out on a wall-clock
+            # deadline instead of being kept alive forever. Also needs Python 3.
+            add_test(
+                NAME e2e_flood
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_flood.sh
+            )
+            set_tests_properties(e2e_flood PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
-            message(STATUS "Python 3 not found — skipping e2e_lossy and e2e_corrupt tests")
+            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack and e2e_flood tests")
         endif()
     endif()
 endif()
