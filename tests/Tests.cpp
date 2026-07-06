@@ -154,6 +154,10 @@ TEST(Protocol, SanitizeNameRejectsDangerous) {
     EXPECT_EQ(Protocol::sanitizeName("CON"), "file.out");             // device
     EXPECT_EQ(Protocol::sanitizeName("com1.txt"), "file.out");        // device + ext, any case
     EXPECT_EQ(Protocol::sanitizeName("LPT9"), "file.out");
+    EXPECT_EQ(Protocol::sanitizeName("con "), "file.out");            // trailing space
+    EXPECT_EQ(Protocol::sanitizeName("aux "), "file.out");            // trailing space, other device
+    EXPECT_EQ(Protocol::sanitizeName("com1 .txt"), "file.out");       // trailing space before ext
+    EXPECT_EQ(Protocol::sanitizeName("console.log"), "console.log");  // base "console" is not a device
 }
 
 TEST(Protocol, SanitizeNameRejectsControlBytes) {
