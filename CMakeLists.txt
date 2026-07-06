@@ -107,6 +107,21 @@ if(BUILD_TESTING)
             TIMEOUT 120
         )
 
+        # Send-failure variant: a sibling C shim forces the sender's sendto() to
+        # fail with ENETDOWN, so a total local send failure (network unreachable)
+        # exits non-zero instead of printing "Sent ..." and returning 0.
+        add_library(failsendto SHARED tests/failsendto.c)
+        target_link_libraries(failsendto PRIVATE ${CMAKE_DL_LIBS})
+
+        add_test(
+            NAME e2e_sendfail
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_sendfail.sh
+        )
+        set_tests_properties(e2e_sendfail PROPERTIES
+            ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;FAILLIB=$<TARGET_FILE:failsendto>"
+            TIMEOUT 120
+        )
+
         # Lossy variant: a Python UDP proxy drops packets in both directions to
         # exercise the RESEND recovery branch. Skipped if Python 3 is missing.
         find_package(Python3 COMPONENTS Interpreter QUIET)

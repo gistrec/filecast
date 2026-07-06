@@ -54,7 +54,9 @@ bool readFileAt(size_t offset, char* out, size_t len) {
     return static_cast<size_t>(input_file.gcount()) == len;
 }
 
-bool sendPart(size_t part_index) {
+// false = fatal read error; a failed send sets *delivered = false instead so the
+// caller can distinguish an all-failed transfer from ordinary UDP loss.
+bool sendPart(size_t part_index, bool* delivered = nullptr) {
     size_t offset        = part_index * static_cast<size_t>(mtu);
     size_t packet_length = file_length - offset;
     if (packet_length > static_cast<size_t>(mtu)) packet_length = static_cast<size_t>(mtu);
@@ -74,6 +76,7 @@ bool sendPart(size_t part_index) {
         std::cerr << "Warning: Failed to send part " << part_index << std::endl;
         return true;
     }
+    if (delivered) *delivered = true;
     if (verbose) {
         std::cout << "Part " << part_index << " with size " << packet_length << " was sent" << std::endl;
     }
@@ -164,13 +167,21 @@ bool sendAnnounce() {
     memcpy(buffer + Protocol::ANNOUNCE_FIXED, name.data(), name.size());
     int announce_len = static_cast<int>(Protocol::ANNOUNCE_FIXED + name.size());
 
+    int announce_sent = 0;
     for (int i = 0; i < 3; ++i) {
         if (sendto(_socket, buffer, announce_len, 0,
                    reinterpret_cast<sockaddr*>(&broadcast_address),
                    sizeof(broadcast_address)) < 0) {
             std::cerr << "Warning: Failed to send ANNOUNCE" << std::endl;
+        } else {
+            ++announce_sent;
         }
         if (i + 1 < 3) pace();
+    }
+    // All ANNOUNCEs rejected locally: no receiver can start, so fail.
+    if (announce_sent == 0) {
+        std::cerr << "Error: Failed to send ANNOUNCE; the network is unreachable" << std::endl;
+        return false;
     }
     if (verbose) {
         std::cout << "Ok: Sent information about new file with size " << file_length << std::endl;
@@ -272,18 +283,30 @@ int run() {
     reporter.start("Sending " + name, file_length, verbose);
 
     size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
+    size_t delivered_parts = 0;
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
-        if (!sendPart(part_index)) {
+        bool delivered = false;
+        if (!sendPart(part_index, &delivered)) {
             reporter.finish();
             delete[] buffer;
             buffer = nullptr;
             input_file.close();
             return 1;
         }
+        if (delivered) ++delivered_parts;
         reporter.update(std::min((part_index + 1) * static_cast<size_t>(mtu), file_length));
         pace();
     }
     reporter.finish();
+
+    // Not one part reached the kernel: a local send failure, not UDP loss.
+    if (delivered_parts == 0) {
+        std::cerr << "Error: Failed to send any data; the network is unreachable" << std::endl;
+        delete[] buffer;
+        buffer = nullptr;
+        input_file.close();
+        return 1;
+    }
 
     double secs = reporter.elapsed();
     double rate = secs > 0 ? file_length / secs : 0;
