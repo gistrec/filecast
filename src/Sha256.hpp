@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <istream>
 #include <string>
+#include <vector>
 
 namespace Sha256 {
 
@@ -118,6 +120,28 @@ inline void hash(const void* data, size_t len, uint8_t out[32]) {
     init(c);
     update(c, static_cast<const uint8_t*>(data), len);
     finish(c, out);
+}
+
+// Compute the SHA-256 digest of `expected_len` bytes read from `in`.
+inline bool hashStream(std::istream& in, size_t expected_len, uint8_t out[32],
+                       size_t buffer_size = 1024 * 1024) {
+    Ctx c;
+    init(c);
+    std::vector<char> buf(buffer_size);
+    size_t total = 0;
+
+    while (in.good()) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));  // Flawfinder: ignore (buf sized to buffer_size)
+        std::streamsize got = in.gcount();
+        if (got > 0) {
+            update(c, reinterpret_cast<const uint8_t*>(buf.data()), static_cast<size_t>(got));
+            total += static_cast<size_t>(got);
+        }
+        if (got == 0) break;
+    }
+    if (total != expected_len) return false;
+    finish(c, out);
+    return true;
 }
 
 // 64-character lowercase hex of a 32-byte digest.

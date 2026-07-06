@@ -16,12 +16,12 @@
 #include <csignal>
 #include <string>
 #include <algorithm>
-#include <random>
 #include <vector>
 #include <set>
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>   // open, O_EXCL, O_NOFOLLOW, AT_FDCWD
+#include <sys/stat.h>
 #include <unistd.h>  // read, write, close, link, unlink
 #endif
 
@@ -43,9 +43,9 @@ void installSignalHandlers() {
 #endif
 }
 
-// Hard upper bound on the file size announced by a sender. We allocate the file
-// in RAM, so anything larger than this would either fail or cause OOM. Adjust
-// only if you know the receiver has enough memory.
+// Hard upper bound imposed by the v3 wire format: file_size is a 4-byte field.
+// Disk-backed storage removes the RAM pressure, but v3 still cannot represent
+// anything larger than this without a protocol bump.
 constexpr size_t MAX_FILE_LENGTH = 4ULL * 1024 * 1024 * 1024; // 4 GiB
 
 // Session the receiver is currently bound to. The sender stamps a random id into
@@ -81,6 +81,16 @@ std::string announced_name;
 // bytes that drives it.
 Progress::Reporter reporter;
 size_t received_bytes = 0;
+std::string part_path;
+bool storage_ready = false;
+bool storage_failed = false;
+
+#if defined(_WIN32) || defined(_WIN64)
+HANDLE part_handle = INVALID_HANDLE_VALUE;
+#else
+int part_fd = -1;
+int durableSync(int fd);
+#endif
 
 /**
  * List of received parts
@@ -103,6 +113,121 @@ std::vector<size_t> getEmptyParts() {
     return result;
 }
 
+std::string snapshotPartPath() {
+    return fileName + ".part";
+}
+
+void closePartFile(bool flush) {
+    #if defined(_WIN32) || defined(_WIN64)
+    if (part_handle == INVALID_HANDLE_VALUE) return;
+    if (flush) FlushFileBuffers(part_handle);
+    CloseHandle(part_handle);
+    part_handle = INVALID_HANDLE_VALUE;
+    #else
+    if (part_fd < 0) return;
+    if (flush) durableSync(part_fd);
+    close(part_fd);
+    part_fd = -1;
+    #endif
+}
+
+bool openPartFile(bool reuse_existing) {
+    closePartFile(false);
+    part_path = snapshotPartPath();
+    storage_ready = false;
+    storage_failed = false;
+
+    #if defined(_WIN32) || defined(_WIN64)
+    DWORD disposition = reuse_existing ? OPEN_EXISTING : CREATE_ALWAYS;
+    part_handle = CreateFileA(part_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (part_handle == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER pos;
+    if (reuse_existing) {
+        if (!GetFileSizeEx(part_handle, &pos) ||
+            static_cast<uint64_t>(pos.QuadPart) != static_cast<uint64_t>(file_length)) {
+            closePartFile(false);
+            return false;
+        }
+    } else {
+        pos.QuadPart = static_cast<LONGLONG>(file_length);
+        if (!SetFilePointerEx(part_handle, pos, nullptr, FILE_BEGIN) ||
+            !SetEndOfFile(part_handle)) {
+            closePartFile(false);
+            return false;
+        }
+    }
+    #else
+    int flags = O_RDWR | O_CREAT | O_NOFOLLOW;
+    if (!reuse_existing) flags |= O_TRUNC;
+    part_fd = open(part_path.c_str(), flags, 0644);
+    if (part_fd < 0) return false;
+
+    if (reuse_existing) {
+        struct stat st;
+        if (fstat(part_fd, &st) != 0 || st.st_size < 0 ||
+            static_cast<size_t>(st.st_size) != file_length) {
+            closePartFile(false);
+            return false;
+        }
+    } else if (ftruncate(part_fd, static_cast<off_t>(file_length)) != 0) {
+        closePartFile(false);
+        return false;
+    }
+    #endif
+
+    storage_ready = true;
+    return true;
+}
+
+bool writePartAt(size_t offset, const char* data, size_t len) {
+    if (!storage_ready) return false;
+    #if defined(_WIN32) || defined(_WIN64)
+    LARGE_INTEGER pos;
+    pos.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(part_handle, pos, nullptr, FILE_BEGIN)) return false;
+    size_t off = 0;
+    while (off < len) {
+        DWORD chunk = (len - off > 0x40000000u) ? 0x40000000u
+                                                : static_cast<DWORD>(len - off);
+        DWORD wrote = 0;
+        if (!WriteFile(part_handle, data + off, chunk, &wrote, nullptr) || wrote == 0) {
+            return false;
+        }
+        off += wrote;
+    }
+    return true;
+    #else
+    size_t done = 0;
+    while (done < len) {
+        ssize_t w = pwrite(part_fd, data + done, len - done,
+                           static_cast<off_t>(offset + done));
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (w == 0) return false;
+        done += static_cast<size_t>(w);
+    }
+    return true;
+    #endif
+}
+
+bool hashPartFile(uint8_t out[32]) {
+    closePartFile(true);
+    std::ifstream in(part_path, std::ifstream::binary);
+    if (!in.is_open()) return false;
+    return Sha256::hashStream(in, file_length, out);
+}
+
+void removePartFiles() {
+    closePartFile(false);
+    std::remove(snapshotPartPath().c_str());
+    std::remove((fileName + ".part.idx").c_str());
+    storage_ready = false;
+}
+
 // Validate and store one TRANSFER packet, parsing it from scratch — the packet
 // may come from the main loop or the recovery loop, and full self-validation
 // keeps the two call sites from ever drifting apart. Returns true when a new
@@ -122,12 +247,16 @@ bool handleTransfer(const char* buf, int64_t length) {
 
     // For non-final parts size must equal the chunk size; for the final part it
     // must equal the remaining bytes. Anything else is malformed and would
-    // either silently zero-pad data or write past the file buffer.
+    // either silently zero-pad data or write past the output file.
     if (size != Protocol::expectedPartSize(part, file_length, chunk_size)) return false;
     if (static_cast<size_t>(length) < size + Protocol::TRANSFER_HEADER) return false;
 
+    if (!writePartAt(part * chunk_size, buf + Protocol::TRANSFER_HEADER, size)) {
+        std::cerr << "Error: Failed to write received data to " << part_path << std::endl;
+        storage_failed = true;
+        return false;
+    }
     parts.insert(part);
-    memcpy(file + part * chunk_size, buf + Protocol::TRANSFER_HEADER, size);
     received_bytes += size;
     reporter.update(received_bytes);
     if (verbose) std::cout << "Receive " << part << " part with size " << size << std::endl;
@@ -175,60 +304,8 @@ void syncParentDir(const std::string& path) {
 }
 #endif
 
-// Write len bytes to a fresh temp file `tmp`, flushing the data to stable storage
-// before returning so the reassembled output survives an OS crash or power loss.
-// On POSIX O_EXCL|O_NOFOLLOW means a symlink or pre-existing file planted at that
-// path is rejected rather than followed/overwritten. Returns false on I/O error.
-bool writeTempFile(const std::string& tmp, const char* data, size_t len) {
-    #if defined(_WIN32) || defined(_WIN64)
-    // CREATE_NEW mirrors the POSIX O_EXCL below: a file planted at the temp
-    // path fails the create instead of being truncated. FlushFileBuffers forces
-    // the payload to disk before the move so a power loss can't leave a
-    // torn/empty output (MoveFileEx WRITE_THROUGH flushes only cross-volume
-    // copies, not a same-volume rename).
-    HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
-                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    bool ok = true;
-    for (size_t off = 0; off < len; ) {
-        // WriteFile takes a DWORD count; cap each write at 1 GiB.
-        DWORD chunk = (len - off > 0x40000000u) ? 0x40000000u
-                                                : static_cast<DWORD>(len - off);
-        DWORD wrote = 0;
-        if (!WriteFile(h, data + off, chunk, &wrote, nullptr) || wrote == 0) {
-            ok = false;
-            break;
-        }
-        off += wrote;
-    }
-    if (ok && !FlushFileBuffers(h)) ok = false;
-    if (!CloseHandle(h)) ok = false;
-    return ok;
-    #else
-    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
-    if (fd < 0) return false;
-    bool ok = true;
-    for (size_t off = 0; off < len; ) {
-        ssize_t w = write(fd, data + off, len - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;  // interrupted by a signal — retry
-            ok = false;
-            break;
-        }
-        if (w == 0) {  // not expected for a regular file
-            ok = false;
-            break;
-        }
-        off += static_cast<size_t>(w);
-    }
-    if (ok && durableSync(fd) != 0) ok = false;  // flush data to disk before rename
-    if (close(fd) != 0) ok = false;
-    return ok;
-    #endif
-}
-
 // Atomically move `tmp` onto `target`, replacing any existing file. The payload
-// was already flushed by writeTempFile; here we make the rename itself durable.
+// was already flushed by the caller; here we make the rename itself durable.
 // On Windows MoveFileEx replaces atomically (a plain rename can't clobber) and
 // WRITE_THROUGH flushes the operation; on POSIX rename is atomic and we flush the
 // directory so the rename survives a crash. Returns false on failure, leaving the
@@ -284,43 +361,32 @@ Finalize finalizeNoClobber(const std::string& tmp, const std::string& target) {
     #endif
 }
 
-// Write len bytes to a randomly-named temp beside `target`, then atomically
-// move it onto `target` — replacing an existing file only when --overwrite was
-// given. The random suffix keeps a hostile sender from predicting the temp
-// path. Returns a process exit code; on finalize failure the verified temp is
-// kept so no data is lost.
-int writeVerified(const std::string& target, const char* data, size_t len) {
-    std::random_device rd;
-    char suffix[24];
-    snprintf(suffix, sizeof(suffix), ".part.%08x%08x",
-             static_cast<unsigned>(rd()), static_cast<unsigned>(rd()));
-    const std::string tmp = target + suffix;
-
-    if (!writeTempFile(tmp, data, len)) {
-        std::cerr << "Error: Failed to write output file " << tmp << std::endl;
-        std::remove(tmp.c_str());
-        return 2;
-    }
+// Move the verified on-disk .part file into place. On failure the .part file is
+// kept so the user does not lose a completed transfer.
+int finalizeVerifiedPart(const std::string& target) {
+    closePartFile(true);
     if (overwrite) {
-        if (finalizeReplace(tmp, target)) return 0;
+        if (finalizeReplace(part_path, target)) {
+            storage_ready = false;
+            return 0;
+        }
         std::cerr << "Error: Failed to finalize " << target
-                  << "; verified data kept at " << tmp << std::endl;
+                  << "; verified data kept at " << part_path << std::endl;
         return 2;
     }
-    switch (finalizeNoClobber(tmp, target)) {
+    switch (finalizeNoClobber(part_path, target)) {
         case Finalize::Ok:
+            storage_ready = false;
             return 0;
         case Finalize::Exists:
-            // The target appeared after verifyAndWrite's early check (e.g. a
-            // second receiver in the same directory finished first).
             std::cerr << "Error: output file " << target
                       << " already exists (use --overwrite to replace it); "
-                      << "verified data kept at " << tmp << std::endl;
+                      << "verified data kept at " << part_path << std::endl;
             return 2;
         case Finalize::Error:
         default:
             std::cerr << "Error: Failed to finalize " << target
-                      << "; verified data kept at " << tmp << std::endl;
+                      << "; verified data kept at " << part_path << std::endl;
             return 2;
     }
 }
@@ -358,9 +424,8 @@ bool writeRawFile(const std::string& path, const char* data, size_t len) {
 
 // Read up to `max` bytes of `path` into `out`, reporting the count in `got`.
 // On POSIX O_NOFOLLOW refuses to follow a symlink planted at that path, matching
-// the write side (writeRawFile/writeVerified) — otherwise a hostile symlink could
-// make resume slurp an arbitrary file the receiver can read into the buffer that
-// saveSnapshot later writes back out. Returns false on open/read error.
+// the write side — otherwise a hostile symlink could make resume trust an
+// arbitrary file the receiver can read. Returns false on open/read error.
 bool readRawFile(const std::string& path, char* out, size_t max, size_t& got) {
     #if defined(_WIN32) || defined(_WIN64)
     std::ifstream in(path, std::ifstream::binary);
@@ -390,18 +455,14 @@ bool readRawFile(const std::string& path, char* out, size_t max, size_t& got) {
 // snapshot header: "FCIDX1"+NUL(7) + sha256(32) + file_length(8) + chunk(4).
 constexpr size_t SNAPSHOT_HEADER = 51;
 
-// Persist the partial buffer to <name>.part and a bitmap of received parts to
+// Flush the partial <name>.part file and persist a bitmap of received parts to
 // <name>.part.idx, so a later --resume run keyed on the file's SHA-256 can pick
 // up where this one left off. Best-effort: a failure only means no resume.
 // Gated on --resume so a plain receive never leaves surprise .part files behind
 // (nor pays the synchronous whole-buffer write) when interrupted.
-void saveSnapshot() {
-    if (!resume || file == nullptr || !have_session) return;
-    const std::string partPath = fileName + ".part";
-    if (!writeRawFile(partPath, file, file_length)) {
-        std::cerr << "Warning: could not save resume snapshot to " << partPath << std::endl;
-        return;
-    }
+bool saveSnapshot() {
+    if (!resume || !storage_ready || !have_session) return false;
+    closePartFile(true);
     size_t total = totalParts();
     std::vector<char> idx(SNAPSHOT_HEADER + (total + 7) / 8, 0);
     memcpy(idx.data(), "FCIDX1", 7);  // 6 chars + trailing NUL
@@ -409,7 +470,7 @@ void saveSnapshot() {
     Utils::writeBytesFromNumber(idx.data() + 39, file_length, 8);
     Utils::writeBytesFromNumber(idx.data() + 47, chunk_size,  4);
     for (size_t p : parts) idx[SNAPSHOT_HEADER + p / 8] |= static_cast<char>(1 << (p % 8));
-    writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
+    return writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
 }
 
 // Remove the snapshot once the transfer has completed and been written out.
@@ -418,9 +479,9 @@ void discardSnapshot() {
     std::remove((fileName + ".part.idx").c_str());
 }
 
-// Try to load a matching snapshot into `file`/`parts`. Only reuses data whose
-// idx records the same SHA-256, size and chunk as the current transfer. Returns
-// true on a successful resume (file/parts/received_bytes are populated).
+// Try to load a matching snapshot into the part file and part registry. Only
+// reuses data whose idx records the same SHA-256, size and chunk as the current
+// transfer. Returns true on a successful resume.
 bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
     size_t total  = Protocol::totalParts(announced, chunk);
     size_t bmSize = (total + 7) / 8;
@@ -437,16 +498,8 @@ bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
     if (Utils::getNumberFromBytes(idx.data() + 47, 4) != chunk) return false;
     const char* bm = idx.data() + SNAPSHOT_HEADER;
 
-    char* buf = new (std::nothrow) char[announced];
-    if (!buf) return false;
-    got = 0;
-    if (!readRawFile(fileName + ".part", buf, announced, got) || got != announced) {
-        delete[] buf;
-        return false;
-    }
+    if (!openPartFile(true)) return false;
 
-    delete[] file;
-    file = buf;
     parts.clear();
     received_bytes = 0;
     for (size_t p = 0; p < total; ++p) {
@@ -461,15 +514,14 @@ bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
 // Snapshot the partial file and clean up after Ctrl+C/SIGTERM. Returns 130.
 int onInterrupt(char* buffer) {
     reporter.finish();
-    saveSnapshot();
-    if (resume && file != nullptr) {
+    bool saved = saveSnapshot();
+    if (saved) {
         std::cerr << "\nInterrupted; progress saved (retry with --resume)" << std::endl;
     } else {
         std::cerr << "\nInterrupted" << std::endl;
+        removePartFiles();
     }
     delete[] buffer;
-    delete[] file;
-    file = nullptr;
     return 130;
 }
 
@@ -479,13 +531,13 @@ int onInterrupt(char* buffer) {
 // clean up. Returns 2. Mirrors the checkParts timeout path so both timeouts save.
 int onTimeout(char* buffer) {
     reporter.finish();
-    saveSnapshot();
-    if (resume && file != nullptr) {
+    bool saved = saveSnapshot();
+    if (saved) {
         std::cerr << "Transfer timed out; progress saved (retry with --resume)" << std::endl;
+    } else {
+        removePartFiles();
     }
     delete[] buffer;
-    delete[] file;
-    file = nullptr;
     return 2;
 }
 
@@ -493,12 +545,11 @@ int onTimeout(char* buffer) {
 // caller has already freed its receive buffer. Returns 2.
 int onRecoveryTimeout(size_t missing) {
     reporter.finish();  // clear the bar before the error line
-    saveSnapshot();     // keep progress so a later --resume can finish it
+    bool saved = saveSnapshot();  // keep progress so a later --resume can finish it
     std::cerr << "Error: Transfer timed out with " << missing << " part(s) missing";
-    if (resume) std::cerr << "; progress saved (retry with --resume)";
+    if (saved) std::cerr << "; progress saved (retry with --resume)";
+    else removePartFiles();
     std::cerr << std::endl;
-    delete[] file;
-    file = nullptr;
     return 2;
 }
 
@@ -508,33 +559,34 @@ int verifyAndWrite() {
     reporter.finish();
 
     uint8_t got[32];
-    Sha256::hash(file, file_length, got);
+    if (!hashPartFile(got)) {
+        std::cerr << "Error: Failed to read received file for checksum" << std::endl;
+        if (resume) discardSnapshot();
+        else removePartFiles();
+        return 2;
+    }
     if (memcmp(got, expected_hash, 32) != 0) {
         std::cerr << "Error: checksum mismatch — received file is corrupt" << std::endl;
         // A resumed snapshot whose bytes are corrupt (e.g. torn write) would fail
         // here forever; drop it so the next --resume starts clean instead of
         // reloading the same poison.
         if (resume) discardSnapshot();
-        delete[] file;
-        file = nullptr;
+        else removePartFiles();
         return 2;
     }
 
     // Refuse to clobber an existing file unless the user opted in. This check
-    // fails fast before the temp write; the atomic no-clobber finalize inside
-    // writeVerified is what enforces it when the file appears mid-write.
+    // fails fast before the atomic no-clobber finalize, which still enforces it
+    // if the file appears mid-write.
     if (!overwrite && fileExists(fileName)) {
         std::cerr << "Error: output file " << fileName
                   << " already exists (use --overwrite to replace it)" << std::endl;
-        delete[] file;
-        file = nullptr;
+        if (!resume) removePartFiles();
         return 2;
     }
 
-    int wc = writeVerified(fileName, file, file_length);
+    int wc = finalizeVerifiedPart(fileName);
     if (wc != 0) {
-        delete[] file;
-        file = nullptr;
         return wc;
     }
     discardSnapshot();  // transfer complete — the .part snapshot is no longer needed
@@ -548,8 +600,6 @@ int verifyAndWrite() {
     }
     std::cout << "; sha256 verified" << std::endl;
 
-    delete[] file;
-    file = nullptr;
     return 0;
 }
 
@@ -563,8 +613,7 @@ int checkParts() {
     char* buffer = new (std::nothrow) char[bufcap];
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
-        delete[] file;
-        file = nullptr;
+        removePartFiles();
         return 1;
     }
 
@@ -608,6 +657,11 @@ int checkParts() {
                 continue;
             }
             if (handleTransfer(buffer, static_cast<int64_t>(length))) progressed = true;
+            if (storage_failed) {
+                delete[] buffer;
+                if (!resume) removePartFiles();
+                return 2;
+            }
         }
 
         // A new part refreshes ttl; a round with no progress counts down toward
@@ -667,14 +721,13 @@ bool growRecvBuffer(char*& buf, size_t& bufcap, int& exit_code) {
     return true;
 }
 
-// Allocate a fresh (empty) file buffer for a new transfer.
-bool allocateFileFresh(int& exit_code) {
-    delete[] file;
+// Create a fresh on-disk part file for a new transfer.
+bool createPartFresh(int& exit_code) {
+    closePartFile(false);
     parts.clear();
     received_bytes = 0;
-    file = new (std::nothrow) char[file_length];
-    if (!file) {
-        std::cerr << "Error: Can't allocate " << file_length << " bytes" << std::endl;
+    if (!openPartFile(false)) {
+        std::cerr << "Error: Can't create temporary output file " << snapshotPartPath() << std::endl;
         exit_code = 1;
         return false;
     }
@@ -687,7 +740,7 @@ bool prepareStorage(char*& buf, size_t& bufcap, size_t announced, size_t chunk,
                     bool& resumed, int& exit_code) {
     if (!growRecvBuffer(buf, bufcap, exit_code)) return false;
     resumed = resume && tryResume(announced, chunk, expected_hash);
-    if (!resumed && !allocateFileFresh(exit_code)) return false;
+    if (!resumed && !createPartFresh(exit_code)) return false;
     return true;
 }
 
@@ -720,7 +773,7 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
     if (!announceValid(announced, incoming_cs, exit_code)) return false;
 
     // Duplicate retransmission of the same ANNOUNCE: keep accumulated parts.
-    if (file != nullptr && announced == file_length && incoming_cs == chunk_size) return true;
+    if (storage_ready && announced == file_length && incoming_cs == chunk_size) return true;
 
     session_id   = incoming_sid;
     have_session = true;
@@ -783,7 +836,8 @@ int dispatchPacket(char*& buf, size_t& bufcap, int64_t length, bool& finish) {
             break;
         }
         case Protocol::Type::Transfer:
-            if (file != nullptr && handleTransfer(buf, length)) ttl = ttl_max;
+            if (storage_ready && handleTransfer(buf, length)) ttl = ttl_max;
+            if (storage_failed) return 2;
             break;
         case Protocol::Type::Finish:
             handleFinish(h.session, finish);
@@ -815,7 +869,7 @@ int run() {
         // Sender finished transferring — move to the recovery phase (or bail if
         // we joined too late to ever have received the ANNOUNCE).
         if (finish) {
-            if (file != nullptr) {
+            if (storage_ready) {
                 delete[] buffer;
                 return checkParts();
             }
@@ -843,8 +897,7 @@ int run() {
         int code = dispatchPacket(buffer, bufcap, static_cast<int64_t>(length), finish);
         if (code >= 0) {
             delete[] buffer;
-            delete[] file;
-            file = nullptr;
+            if (code != 0 && !resume) removePartFiles();
             return code;
         }
     }
