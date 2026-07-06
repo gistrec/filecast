@@ -22,12 +22,9 @@ TYPE_TRANSFER = 2
 HEADER_SIZE = 10
 ANNOUNCE_FIXED = HEADER_SIZE + 42  # header + size(4) + chunk(4) + hash(32) + name_len(2)
 
-# The forged file the attacker claims. A different length is enough to miss the
-# receiver's duplicate-ANNOUNCE check and drive the (buggy) re-latch path. The
-# length and chunk size are overridable so the test can also forge values that
-# would *fail* the receiver's range check (empty file, out-of-range chunk): those
-# must be dropped by the same-session guard before announceValid() turns them into
-# a fatal error -- the one-packet DoS the guard has to close.
+# The forged file the attacker claims. Length/chunk are overridable so the test
+# can also forge values announceValid() rejects (empty file, out-of-range chunk),
+# which the guard must drop before they become a fatal error.
 FORGED_NAME = b"evil"
 FORGED_HASH = bytes([0xAB]) * 32
 

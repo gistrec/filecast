@@ -794,16 +794,10 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
     size_t name_len    = Protocol::getU16(buf + Protocol::HEADER_SIZE + 40);
     if (static_cast<size_t>(length) < Protocol::ANNOUNCE_FIXED + name_len) return true;  // truncated
 
-    // Once storage is open we are committed to this session's file. The session
-    // id is public (cleartext in every broadcast), so any same-session ANNOUNCE
-    // that differs is hostile or corrupt: re-latching would ftruncate the .part
-    // and swap the hash, resetting or hijacking the transfer. Drop it here,
-    // *before* announceValid() and *before* refreshing ttl -- a forged empty file
-    // or out-of-range chunk size would otherwise fail validation and terminate
-    // the receiver (a one-packet DoS), and letting forgeries refresh ttl would
-    // let a hostile host hold the receiver open indefinitely. A matching ANNOUNCE
-    // is a harmless retransmission from our sender and does refresh ttl; a genuine
-    // restart draws a fresh session id and is rejected by the gate above.
+    // Storage open means we are committed to this session's file. Drop a differing
+    // same-session ANNOUNCE before announceValid() and the ttl refresh, so a forged
+    // empty/oversized one can neither fail validation and kill the receiver nor
+    // hold it open. A matching one just refreshes ttl; a restart draws a new session.
     if (storage_ready) {
         bool same = announced == file_length && incoming_cs == chunk_size &&
                     memcmp(expected_hash, buf + Protocol::HEADER_SIZE + 8, 32) == 0;
@@ -816,10 +810,10 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
         return true;
     }
 
-    // First ANNOUNCE of the run. Only a recognised packet from our sender
-    // refreshes ttl; unrecognised traffic (stray broadcasts, other receivers'
-    // RESENDs, garbage) deliberately does not, so the timeout stays reachable and
-    // a hostile or noisy host cannot keep the receiver alive forever.
+    // Only a recognised packet from our sender refreshes ttl. Unrecognised
+    // traffic (stray broadcasts, other receivers' RESENDs, garbage) deliberately
+    // does not, so the timeout stays reachable and a hostile or noisy host cannot
+    // keep the receiver alive forever.
     ttl = ttl_max;
 
     if (!announceValid(announced, incoming_cs, exit_code)) return false;
