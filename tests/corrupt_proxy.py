@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""
-Corrupting UDP proxy for exercising the checksum-mismatch branch on loopback.
-
-Like lossy_proxy.py this runs two unidirectional proxies in one process:
-
-  * Forward direction:  listen-fwd  -> target-fwd  (sender -> receiver path)
-  * Backward direction: listen-back -> target-back (receiver -> sender path)
-
-Unlike the lossy proxy it drops nothing. Instead, exactly ONE TRANSFER packet
-in the forward direction has a single payload byte flipped; everything else is
-forwarded byte-for-byte. The part still validates (its header, index and length
-fields are untouched, so the receiver accepts and never re-requests it), but the
-reassembled file no longer matches the announced SHA-256 — driving the receiver
-into verifyAndWrite's "checksum mismatch — received file is corrupt" branch.
-
-Only the *first* data-bearing TRANSFER is corrupted, so the outcome is fully
-deterministic regardless of how the OS schedules the datagrams.
-"""
+"""Corrupting UDP proxy for exercising the checksum-mismatch branch on loopback."""
+#
+# Like lossy_proxy.py this runs two unidirectional proxies in one process:
+#
+#   * Forward direction:  listen-fwd  -> target-fwd  (sender -> receiver path)
+#   * Backward direction: listen-back -> target-back (receiver -> sender path)
+#
+# Unlike the lossy proxy it drops nothing. Instead, exactly ONE TRANSFER packet
+# in the forward direction has a single payload byte flipped; everything else is
+# forwarded byte-for-byte. The part still validates (its header, index and length
+# fields are untouched, so the receiver accepts and never re-requests it), but the
+# reassembled file no longer matches the announced SHA-256 — driving the receiver
+# into verifyAndWrite's "checksum mismatch — received file is corrupt" branch.
+#
+# Only the first data-bearing TRANSFER is corrupted, so the outcome is fully
+# deterministic regardless of how the OS schedules the datagrams.
 
 import argparse
 import socket
