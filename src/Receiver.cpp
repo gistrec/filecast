@@ -17,7 +17,6 @@
 #include <string>
 #include <algorithm>
 #include <vector>
-#include <set>
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>   // open, O_EXCL, O_NOFOLLOW, AT_FDCWD
@@ -92,25 +91,28 @@ int part_fd = -1;
 int durableSync(int fd);
 #endif
 
-/**
- * List of received parts
- */
-std::set<size_t> parts;
+// Received-parts registry: one bit per part instead of an std::set<size_t>. A
+// set cost ~48 bytes per stored part, so a 4 GiB file at a 64-byte chunk (67M
+// parts) needed 3+ GB of RAM; the bitmap needs 8 MB. `count` mirrors the number
+// of set bits so size() stays O(1). Its byte layout matches the .part.idx
+// snapshot bitmap, so save/resume copy it wholesale.
+struct PartBitmap {
+    std::vector<uint8_t> bits;
+    size_t count = 0;
+
+    void reset(size_t total) { bits.assign((total + 7) / 8, 0); count = 0; }
+    bool has(size_t i) const { return (bits[i >> 3] >> (i & 7)) & 1u; }
+    void set(size_t i) {
+        uint8_t m = static_cast<uint8_t>(1u << (i & 7));
+        if (!(bits[i >> 3] & m)) { bits[i >> 3] |= m; ++count; }
+    }
+    size_t size() const { return count; }
+};
+
+PartBitmap parts;
 
 size_t totalParts() {
     return Protocol::totalParts(file_length, chunk_size);
-}
-
-/**
- * Get empty parts
- */
-std::vector<size_t> getEmptyParts() {
-    std::vector<size_t> result;
-    size_t total_parts = totalParts();
-    for (size_t i = 0; i < total_parts; i++) {
-        if (parts.find(i) == parts.end()) result.push_back(i);
-    }
-    return result;
 }
 
 std::string snapshotPartPath() {
@@ -247,7 +249,7 @@ bool handleTransfer(const char* buf, int64_t length) {
     size_t size  = Protocol::getU32(buf + Protocol::HEADER_SIZE + 4);
     size_t total = totalParts();
     if (part >= total) return false;
-    if (parts.find(part) != parts.end()) return false;
+    if (parts.has(part)) return false;
 
     // For non-final parts size must equal the chunk size; for the final part it
     // must equal the remaining bytes. Anything else is malformed and would
@@ -260,7 +262,7 @@ bool handleTransfer(const char* buf, int64_t length) {
         storage_failed = true;
         return false;
     }
-    parts.insert(part);
+    parts.set(part);
     received_bytes += size;
     reporter.update(received_bytes);
     if (verbose) std::cout << "Receive " << part << " part with size " << size << std::endl;
@@ -468,12 +470,14 @@ bool saveSnapshot() {
     if (!resume || !storage_ready || !have_session) return false;
     closePartFile(true);
     size_t total = totalParts();
-    std::vector<char> idx(SNAPSHOT_HEADER + (total + 7) / 8, 0);
+    size_t bmSize = (total + 7) / 8;
+    std::vector<char> idx(SNAPSHOT_HEADER + bmSize, 0);
     memcpy(idx.data(), "FCIDX1", 7);  // 6 chars + trailing NUL
     memcpy(idx.data() + 7, expected_hash, 32);
     Utils::writeBytesFromNumber(idx.data() + 39, file_length, 8);
     Utils::writeBytesFromNumber(idx.data() + 47, chunk_size,  4);
-    for (size_t p : parts) idx[SNAPSHOT_HEADER + p / 8] |= static_cast<char>(1 << (p % 8));
+    // The registry bitmap already has the on-disk layout, so copy it wholesale.
+    memcpy(idx.data() + SNAPSHOT_HEADER, parts.bits.data(), bmSize);
     return writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
 }
 
@@ -504,11 +508,11 @@ bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
 
     if (!openPartFile(true)) return false;
 
-    parts.clear();
+    parts.reset(total);
     received_bytes = 0;
     for (size_t p = 0; p < total; ++p) {
         if (bm[p / 8] & (1 << (p % 8))) {
-            parts.insert(p);
+            parts.set(p);
             received_bytes += Protocol::expectedPartSize(p, announced, chunk);
         }
     }
@@ -621,11 +625,15 @@ int checkParts() {
         return 1;
     }
 
-    std::vector<size_t> emptyParts = getEmptyParts();
+    size_t total = totalParts();
 
-    while (ttl && !emptyParts.empty()) {
+    while (ttl && parts.size() < total) {
         if (g_interrupted) return onInterrupt(buffer);
-        for (auto index : emptyParts) {
+        // Re-request every still-missing part. Walking the bitmap in place avoids
+        // materialising a full missing-parts vector, which for a 67M-part file
+        // would be a 512 MB allocation on top of the registry it came from.
+        for (size_t index = 0; index < total; ++index) {
+            if (parts.has(index)) continue;
             Protocol::writeHeader(buffer, Protocol::Type::Resend, session_id);
             Protocol::putU32(buffer + Protocol::HEADER_SIZE, static_cast<uint32_t>(index));
             sendto(_socket, buffer, static_cast<int>(Protocol::RESEND_SIZE), 0,
@@ -673,13 +681,11 @@ int checkParts() {
         // sender still lets recovery terminate instead of livelocking.
         if (progressed) ttl = ttl_max;
         else            ttl--;
-
-        emptyParts = getEmptyParts();
     }
 
     delete[] buffer;
 
-    if (!emptyParts.empty()) return onRecoveryTimeout(emptyParts.size());
+    if (parts.size() < total) return onRecoveryTimeout(total - parts.size());
 
     return verifyAndWrite();
 }
@@ -699,8 +705,8 @@ bool announceValid(size_t announced, size_t chunk, int& exit_code) {
     }
     // Chunk size must be in the sender's valid --mtu range. The lower bound
     // matters for safety: parts = file_length / chunk_size, so a forged tiny
-    // chunk would make getEmptyParts() build a multi-billion-entry vector and
-    // OOM/crash the receiver from two tiny packets.
+    // chunk would size the received-parts bitmap at multiple billions of bits
+    // and OOM/crash the receiver from two tiny packets.
     if (chunk < Protocol::MIN_CHUNK || chunk > Protocol::MAX_CHUNK) {
         std::cerr << "Error: Sender announced invalid chunk size " << chunk << std::endl;
         exit_code = 2;
@@ -728,7 +734,7 @@ bool growRecvBuffer(char*& buf, size_t& bufcap, int& exit_code) {
 // Create a fresh on-disk part file for a new transfer.
 bool createPartFresh(int& exit_code) {
     closePartFile(false);
-    parts.clear();
+    parts.reset(totalParts());
     received_bytes = 0;
     if (!openPartFile(false)) {
         std::cerr << "Error: Can't create temporary output file " << snapshotPartPath() << std::endl;
