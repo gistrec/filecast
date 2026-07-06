@@ -147,14 +147,28 @@ inline bool isReservedDeviceName(const std::string& name) {
     return false;
 }
 
+// Does the name contain a control byte (< 0x20, incl. NUL) or DEL (0x7f)?
+// Two distinct attacks ride in via such bytes from a hostile announcement:
+//   * an embedded NUL truncates the C string we hand to open()/rename(), so the
+//     file lands on disk under a shorter name than the one we printed (and the
+//     ".part" suffix silently disappears);
+//   * an ANSI escape (ESC, 0x1b) smuggled into the name hijacks the receiver's
+//     terminal when we echo "Receiving <name>" / "Received <name>".
+inline bool hasControlChar(const std::string& name) {
+    return std::any_of(name.begin(), name.end(), [](unsigned char c) {
+        return c < 0x20 || c == 0x7f;
+    });
+}
+
 // Reduce a sender-supplied name to a safe base name in the working directory:
-// strip directories, and reject traversal, ':' (Windows drive-relative / ADS)
-// and reserved device names by falling back to "file.out".
+// strip directories, and reject traversal, ':' (Windows drive-relative / ADS),
+// control/NUL bytes and reserved device names by falling back to "file.out".
 inline std::string sanitizeName(const std::string& raw) {
     size_t slash = raw.find_last_of("/\\");
     std::string name = (slash == std::string::npos) ? raw : raw.substr(slash + 1);
     if (name.empty() || name == "." || name == "..") return "file.out";
     if (name.find(':') != std::string::npos) return "file.out";
+    if (hasControlChar(name)) return "file.out";
     if (isReservedDeviceName(name)) return "file.out";
     return name;
 }
