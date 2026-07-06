@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <cstring>
+#include <cerrno>
 #include <cstdio>
 #include <cstdint>
 #include <string>
@@ -55,8 +56,10 @@ bool readFileAt(size_t offset, char* out, size_t len) {
 }
 
 // false = fatal read error; a failed send sets *delivered = false instead so the
-// caller can distinguish an all-failed transfer from ordinary UDP loss.
-bool sendPart(size_t part_index, bool* delivered = nullptr) {
+// caller can distinguish an all-failed transfer from ordinary UDP loss. A send
+// failure also records its errno in *send_errno so the caller can name the cause
+// when nothing got through at all.
+bool sendPart(size_t part_index, bool* delivered = nullptr, int* send_errno = nullptr) {
     size_t offset        = part_index * static_cast<size_t>(mtu);
     size_t packet_length = file_length - offset;
     if (packet_length > static_cast<size_t>(mtu)) packet_length = static_cast<size_t>(mtu);
@@ -73,6 +76,7 @@ bool sendPart(size_t part_index, bool* delivered = nullptr) {
     auto sent = sendto(_socket, buffer, static_cast<int>(packet_length + Protocol::TRANSFER_HEADER), 0,
                        reinterpret_cast<sockaddr*>(&broadcast_address), sizeof(broadcast_address));
     if (sent < 0) {
+        if (send_errno) *send_errno = errno;
         std::cerr << "Warning: Failed to send part " << part_index << std::endl;
         return true;
     }
@@ -168,10 +172,12 @@ bool sendAnnounce() {
     int announce_len = static_cast<int>(Protocol::ANNOUNCE_FIXED + name.size());
 
     int announce_sent = 0;
+    int send_errno = 0;
     for (int i = 0; i < 3; ++i) {
         if (sendto(_socket, buffer, announce_len, 0,
                    reinterpret_cast<sockaddr*>(&broadcast_address),
                    sizeof(broadcast_address)) < 0) {
+            send_errno = errno;
             std::cerr << "Warning: Failed to send ANNOUNCE" << std::endl;
         } else {
             ++announce_sent;
@@ -180,7 +186,8 @@ bool sendAnnounce() {
     }
     // All ANNOUNCEs rejected locally: no receiver can start, so fail.
     if (announce_sent == 0) {
-        std::cerr << "Error: Failed to send ANNOUNCE; the network is unreachable" << std::endl;
+        std::cerr << "Error: Failed to send ANNOUNCE: " << std::strerror(send_errno)
+                  << "; no receiver can start" << std::endl;
         return false;
     }
     if (verbose) {
@@ -284,9 +291,10 @@ int run() {
 
     size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
     size_t delivered_parts = 0;
+    int send_errno = 0;
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
         bool delivered = false;
-        if (!sendPart(part_index, &delivered)) {
+        if (!sendPart(part_index, &delivered, &send_errno)) {
             reporter.finish();
             delete[] buffer;
             buffer = nullptr;
@@ -301,7 +309,8 @@ int run() {
 
     // Not one part reached the kernel: a local send failure, not UDP loss.
     if (delivered_parts == 0) {
-        std::cerr << "Error: Failed to send any data; the network is unreachable" << std::endl;
+        std::cerr << "Error: Failed to send any data: " << std::strerror(send_errno)
+                  << "; nothing reached the network" << std::endl;
         delete[] buffer;
         buffer = nullptr;
         input_file.close();
