@@ -683,13 +683,12 @@ int checkParts() {
 
     size_t total = totalParts();
 
-    // Recovery runs its own per-round ttl countdown (a round with no new part
-    // counts down; a recovered part refreshes it). The main receive loop now waits
-    // on a wall-clock deadline instead of this counter, so start recovery with a
-    // full budget rather than inheriting whatever the main loop happened to leave.
-    ttl = ttl_max;
+    // Wall-clock deadline (refreshed only by a recovered part), so a junk flood
+    // that keeps recvfrom busy can't freeze recovery the way a per-round counter
+    // would. Recovery still gives up ttl_max seconds after the last real part.
+    refreshDeadline();
 
-    while (ttl && parts.size() < total) {
+    while (!deadlineExpired() && parts.size() < total) {
         if (g_interrupted) return onInterrupt(buffer);
         // Re-request every still-missing part. Walking the bitmap in place avoids
         // materialising a full missing-parts vector, which for a 67M-part file
@@ -714,8 +713,12 @@ int checkParts() {
         memset(&sender_address, 0, sizeof(sender_address));
         addr_len sender_address_length = sizeof(sender_address);
 
-        bool progressed = false;
         while (true) {
+            // Bail on Ctrl+C or the deadline before each read, so a junk flood
+            // that keeps recvfrom busy can't spin the drain loop forever.
+            if (g_interrupted) return onInterrupt(buffer);
+            if (deadlineExpired()) break;
+
             auto length = recvfrom(_socket, buffer, static_cast<int>(bufcap), 0,
                                    reinterpret_cast<sockaddr*>(&sender_address),
                                    &sender_address_length);
@@ -730,19 +733,15 @@ int checkParts() {
                 warnVersionOnce(h.version);
                 continue;
             }
-            if (handleTransfer(buffer, static_cast<int64_t>(length))) progressed = true;
+            // Only a recovered part pushes the deadline; junk and our own
+            // looped-back RESENDs don't, so recovery still terminates.
+            if (handleTransfer(buffer, static_cast<int64_t>(length))) refreshDeadline();
             if (storage_failed) {
                 delete[] buffer;
                 if (!resume) removePartFiles();
                 return 2;
             }
         }
-
-        // A new part refreshes ttl; a round with no progress counts down toward
-        // the timeout. Our own looped-back RESENDs are not TRANSFERs, so a dead
-        // sender still lets recovery terminate instead of livelocking.
-        if (progressed) ttl = ttl_max;
-        else            ttl--;
     }
 
     delete[] buffer;
