@@ -31,10 +31,12 @@ TRANSFER_HEADER = 18  # HEADER_SIZE(10) + part(4) + length(4); payload starts he
 
 
 def is_transfer(data):
+    """True if data is a data-bearing v3 TRANSFER packet (right magic and type)."""
     return len(data) > TRANSFER_HEADER and data[:4] == MAGIC and data[5] == TYPE_TRANSFER
 
 
 def forward_clean(listen_port, target_host, target_port):
+    """Forward every datagram from listen_port to the target byte-for-byte."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", listen_port))
@@ -44,6 +46,7 @@ def forward_clean(listen_port, target_host, target_port):
 
 
 def forward_corrupt(listen_port, target_host, target_port):
+    """Forward datagrams, flipping one payload byte of the first TRANSFER seen."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", listen_port))
@@ -62,6 +65,7 @@ def forward_corrupt(listen_port, target_host, target_port):
 
 
 def main():
+    """Parse CLI arguments and run the two forwarding threads until killed."""
     p = argparse.ArgumentParser()
     p.add_argument("--listen-fwd",  type=int, required=True,
                    help="Listen port for the sender->receiver direction")

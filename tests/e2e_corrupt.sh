@@ -61,6 +61,11 @@ PROXY_BACK_IN=33604
 run_corrupt_test() {
     local label="$1"
     local extra_flag="$2"
+    # Optional receiver flag as an array so an empty value expands to no argument
+    # (a quoted "" would be passed as a stray empty positional). The +-guard keeps
+    # the expansion safe under `set -u` on bash 3.2 (macOS's default).
+    local -a extra=()
+    [ -n "$extra_flag" ] && extra=("$extra_flag")
 
     local dir="$WORKDIR/$label"
     mkdir -p "$dir"
@@ -86,7 +91,7 @@ run_corrupt_test() {
     # break a relative BINARY like build/filecast).
     "$BINARY" receive "$dir/out.bin" --to 127.0.0.1 \
               --bind-port "$RECV_BIND" --port "$PROXY_BACK_IN" \
-              --ttl 10 --delay-ms 0 $extra_flag > "$recv_log" 2>&1 &
+              --ttl 10 --delay-ms 0 ${extra[@]+"${extra[@]}"} > "$recv_log" 2>&1 &
     RECV_PID=$!
     sleep 1
 
