@@ -140,6 +140,15 @@ bool closePartFile(bool flush) {
     #endif
 }
 
+#if !defined(_WIN32) && !defined(_WIN64)
+// O_NOFOLLOW rejects a symlink but not a pre-planted hardlink; refuse anything
+// that isn't a lone regular file so our writes can't reach a linked victim.
+bool isLoneRegularFile(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1;
+}
+#endif
+
 bool openPartFile(bool reuse_existing) {
     closePartFile(false);
     part_path = snapshotPartPath();
@@ -168,11 +177,15 @@ bool openPartFile(bool reuse_existing) {
         }
     }
     #else
-    int flags = O_RDWR | O_CREAT | O_NOFOLLOW;
-    if (!reuse_existing) flags |= O_TRUNC;
-    part_fd = open(part_path.c_str(), flags, 0644);
+    // No O_TRUNC: it would wipe a pre-planted hardlink's victim before the
+    // isLoneRegularFile guard below could refuse it.
+    part_fd = open(part_path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
     if (part_fd < 0) return false;
 
+    if (!isLoneRegularFile(part_fd)) {
+        closePartFile(false);
+        return false;
+    }
     if (reuse_existing) {
         struct stat st;
         if (fstat(part_fd, &st) != 0 || st.st_size < 0 ||
@@ -415,8 +428,14 @@ bool writeRawFile(const std::string& path, const char* data, size_t len) {
     out.close();
     return static_cast<bool>(out);
     #else
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    // No O_TRUNC: refuse a pre-planted hardlink (isLoneRegularFile) before
+    // truncating, so we can't wipe the linked victim.
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_NOFOLLOW, 0644);
     if (fd < 0) return false;
+    if (!isLoneRegularFile(fd) || ftruncate(fd, 0) != 0) {
+        close(fd);
+        return false;
+    }
     bool ok = true;
     for (size_t off = 0; off < len; ) {
         ssize_t w = write(fd, data + off, len - off);
