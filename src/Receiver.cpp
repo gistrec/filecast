@@ -802,8 +802,33 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
 
     if (!announceValid(announced, incoming_cs, exit_code)) return false;
 
-    // Duplicate retransmission of the same ANNOUNCE: keep accumulated parts.
-    if (storage_ready && announced == file_length && incoming_cs == chunk_size) return true;
+    // Once storage is open we are committed to this session's file. The gate
+    // above already dropped ANNOUNCEs from a different session, so anything that
+    // reaches here carries our session id — which travels in cleartext in every
+    // broadcast packet, so any host on the LAN can read it and replay it. A
+    // same-session ANNOUNCE is therefore one of two things:
+    //
+    //   * matching file_length/chunk_size/hash -> a duplicate retransmission;
+    //     keep the parts we have already accumulated and carry on.
+    //   * differing in any of them -> hostile or corrupt, and must be refused.
+    //     Re-latching would let prepareStorage ftruncate the .part and clear the
+    //     bitmap, so a single forged datagram could reset an almost-complete
+    //     transfer (a repeatable one-packet DoS) or — by also swapping in the
+    //     attacker's hash and name — make injected bytes verify as "sha256
+    //     verified" under a chosen name, defeating the whole integrity guarantee.
+    //
+    // Never reset an active transfer from the network. A sender that genuinely
+    // restarts with a new file draws a fresh session id and is handled by the
+    // different-session gate above.
+    if (storage_ready) {
+        bool same = announced == file_length && incoming_cs == chunk_size &&
+                    memcmp(expected_hash, buf + Protocol::HEADER_SIZE + 8, 32) == 0;
+        if (!same) {
+            std::cerr << "Warning: ignoring conflicting announcement for the active session"
+                      << std::endl;
+        }
+        return true;
+    }
 
     session_id   = incoming_sid;
     have_session = true;

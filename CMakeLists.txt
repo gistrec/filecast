@@ -131,6 +131,19 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # Session-hijack variant: a Python UDP proxy injects one forged ANNOUNCE
+            # reusing the legitimate session id but claiming a different file, so a
+            # receiver that re-latched it would reset/hijack the transfer. Pins the
+            # same-session ANNOUNCE guard in handleAnnounce. Also needs Python 3.
+            add_test(
+                NAME e2e_hijack
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_hijack.sh
+            )
+            set_tests_properties(e2e_hijack PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
             message(STATUS "Python 3 not found — skipping e2e_lossy and e2e_corrupt tests")
         endif()
