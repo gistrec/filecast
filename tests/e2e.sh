@@ -347,5 +347,41 @@ run_timeout_no_sender_test() {
 }
 run_timeout_no_sender_test
 
+# Many parts: a tiny MTU splits even a small file into hundreds of parts, so this
+# drives the received-parts bitmap (set/has/count) across a large index range and
+# checks reassembly stays byte-exact. The bitmap replaced an std::set that scaled
+# at ~48 bytes/part; this pins that the compact representation is still correct.
+run_small_mtu_test() {
+    local dir="$WORKDIR/small-mtu"
+    mkdir -p "$dir"
+    # 64 KiB at a 64-byte MTU -> ~1024 parts.
+    dd if=/dev/urandom of="$dir/src.bin" bs=1024 count=64 status=none
+
+    echo "==> [small-mtu] receiver with --mtu 64 (~1024 parts)"
+    ( cd "$dir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33415 --port 33416 --ttl 5 --mtu 64 --delay-ms 0 > recv.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/src.bin" --to 127.0.0.1 --bind-port 33416 --port 33415 \
+              --ttl 2 --mtu 64 --delay-ms 0 > "$dir/send.log" 2>&1
+
+    if ! wait "$rpid"; then
+        echo "FAIL: [small-mtu] receiver exited non-zero"
+        tail -20 "$dir/recv.log"
+        return 1
+    fi
+    if [ ! -f "$dir/out.bin" ] || ! cmp -s "$dir/src.bin" "$dir/out.bin"; then
+        echo "FAIL: [small-mtu] received file does not match source"
+        return 1
+    fi
+    if ! grep -q "sha256 verified" "$dir/recv.log"; then
+        echo "FAIL: [small-mtu] receiver did not verify the file checksum"
+        tail -20 "$dir/recv.log"
+        return 1
+    fi
+    echo "PASS: [small-mtu] ~1024-part transfer reassembled and verified"
+}
+run_small_mtu_test
+
 echo
 echo "All E2E tests passed."

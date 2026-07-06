@@ -38,11 +38,11 @@ std::string baseName(const std::string& path) {
     return (slash == std::string::npos) ? path : path.substr(slash + 1);
 }
 
-/**
- * Since server may receive many requests for sending some part
- * It is necessary to limit the sending of the same parts for a while
- * This container contains part number and time when the part was sent
- */
+// Rate-limits re-sends: maps a part index to the second it was last re-sent, so
+// a burst of RESEND requests for the same part isn't served more than once a
+// second. Populated lazily on the first RESEND for a part, so it grows with the
+// packet loss actually seen, not with the file size — a 67M-part file no longer
+// preallocates 67M entries (~3 GB) up front.
 std::map<size_t, int64_t> sent_part;
 std::ifstream input_file;
 
@@ -273,7 +273,6 @@ int run() {
 
     size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
-        sent_part.insert({ part_index, 0 });
         if (!sendPart(part_index)) {
             reporter.finish();
             delete[] buffer;
