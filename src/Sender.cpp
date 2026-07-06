@@ -249,12 +249,15 @@ bool serveResends(size_t total_parts, size_t& resent) {
         auto result = recvfrom(_socket, buffer, 2 * mtu, 0,
                                reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
-        // No incoming requests for a while - resend FINISH and decrement ttl.
-        if (result <= 0) {
+        // Timeout (< 0): no requests this round, so re-announce FINISH and count ttl
+        // down. A zero-length datagram is a real event, not silence: ignore it so
+        // empty packets can't drain the resend phase early.
+        if (result < 0) {
             ttl--;
             sendFinish();
             continue;
         }
+        if (result == 0) continue;
 
         // The socket hears our own TRANSFER/FINISH broadcasts too; only RESENDs
         // for our session and current protocol version matter here. A foreign
@@ -359,7 +362,9 @@ int run() {
     Progress::Reporter reporter;
     reporter.start("Sending " + name, file_length, verbose);
 
-    size_t total_parts = (file_length + mtu - 1) / static_cast<size_t>(mtu);
+    // Route through the shared helper so the count stays overflow-safe at the
+    // 0xFFFFFFFF wire limit (a raw file_length + mtu - 1 wraps a 32-bit size_t).
+    size_t total_parts = Protocol::totalParts(file_length, static_cast<size_t>(mtu));
     size_t delivered_parts = 0;
     int send_errno = 0;
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {

@@ -10,8 +10,8 @@
 # Two scenarios run in sequence:
 #   valid   -- the forgery claims a well-formed but conflicting file.
 #   invalid -- the forgery claims an out-of-range chunk size, which would *fail*
-#              announceValid(); the guard must drop it before that check runs, or
-#              the forged packet terminates the receiver -- a one-packet DoS.
+#              the announce range-check; the guard must drop it before that check
+#              runs, or the forged packet terminates the receiver -- a one-packet DoS.
 #
 # Run via:
 #   ctest --test-dir build --output-on-failure
@@ -147,8 +147,8 @@ run_test() {
 }
 
 # A valid-but-conflicting forgery, then one whose out-of-range chunk size would
-# fail announceValid() -- the guard has to drop it before that check to avoid the
-# one-packet DoS.
+# fail the announce range-check -- the guard has to drop it before that check to
+# avoid the one-packet DoS.
 run_test "valid"   4096 1400
 run_test "invalid" 4096 1
 

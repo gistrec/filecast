@@ -42,10 +42,9 @@ void installSignalHandlers() {
 #endif
 }
 
-// Hard upper bound imposed by the v3 wire format: file_size is a 4-byte field.
-// Disk-backed storage removes the RAM pressure, but v3 still cannot represent
-// anything larger than this without a protocol bump.
-constexpr size_t MAX_FILE_LENGTH = 4ULL * 1024 * 1024 * 1024; // 4 GiB
+// Hard upper bound from the v3 wire format's 4-byte file_size field. 0xFFFFFFFF
+// (not 4ULL*1024^3, which wraps to 0 on a 32-bit size_t) keeps the limit exact.
+constexpr size_t MAX_FILE_LENGTH = 0xFFFFFFFFu; // 4 GiB - 1 (v3 wire limit)
 
 // Session the receiver is currently bound to. The sender stamps a random id into
 // every packet; we latch it from the first ANNOUNCE and then reject packets
@@ -715,6 +714,10 @@ int checkParts() {
         // would be a 512 MB allocation on top of the registry it came from.
         for (size_t index = 0; index < total; ++index) {
             if (parts.has(index)) continue;
+            // Honour Ctrl+C and the deadline inside the burst too: a large paced
+            // re-request set can otherwise take many unresponsive seconds.
+            if (g_interrupted) return onInterrupt(buffer);
+            if (deadlineExpired()) break;
             Protocol::writeHeader(buffer, Protocol::Type::Resend, session_id);
             Protocol::putU32(buffer + Protocol::HEADER_SIZE, static_cast<uint32_t>(index));
             sendto(_socket, buffer, static_cast<int>(Protocol::RESEND_SIZE), 0,
@@ -769,31 +772,6 @@ int checkParts() {
     if (parts.size() < total) return onRecoveryTimeout(total - parts.size());
 
     return verifyAndWrite();
-}
-
-// Range-check the announced sizes. Prints and sets exit_code on failure.
-bool announceValid(size_t announced, size_t chunk, int& exit_code) {
-    if (announced == 0) {
-        std::cerr << "Error: Sender announced empty file" << std::endl;
-        exit_code = 2;
-        return false;
-    }
-    if (announced > MAX_FILE_LENGTH) {
-        std::cerr << "Error: Sender announced file size " << announced
-                  << " bytes, exceeds limit of " << MAX_FILE_LENGTH << std::endl;
-        exit_code = 2;
-        return false;
-    }
-    // Chunk size must be in the sender's valid --mtu range. The lower bound
-    // matters for safety: parts = file_length / chunk_size, so a forged tiny
-    // chunk would size the received-parts bitmap at multiple billions of bits
-    // and OOM/crash the receiver from two tiny packets.
-    if (chunk < Protocol::MIN_CHUNK || chunk > Protocol::MAX_CHUNK) {
-        std::cerr << "Error: Sender announced invalid chunk size " << chunk << std::endl;
-        exit_code = 2;
-        return false;
-    }
-    return true;
 }
 
 // Grow the receive buffer so it can hold a full chunk for this transfer.
@@ -856,8 +834,8 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
     if (static_cast<size_t>(length) < Protocol::ANNOUNCE_FIXED + name_len) return true;  // truncated
 
     // Storage open means we are committed to this session's file. Drop a differing
-    // same-session ANNOUNCE before announceValid() and the deadline refresh, so a forged
-    // empty/oversized one can neither fail validation and kill the receiver nor
+    // same-session ANNOUNCE before the range-check and deadline refresh, so a forged
+    // one claiming a different file can neither reset/hijack the active transfer nor
     // hold it open. A matching one just pushes the deadline out; a restart draws a new session.
     if (storage_ready) {
         bool same = announced == file_length && incoming_cs == chunk_size &&
@@ -871,13 +849,18 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
         return true;
     }
 
-    // Only a recognised packet from our sender pushes the timeout out. Unrecognised
-    // traffic (stray broadcasts, other receivers' RESENDs, garbage) deliberately
-    // does not, so the deadline stays reachable and a hostile or noisy host cannot
-    // keep the receiver alive forever.
-    refreshDeadline();
+    // Validate BEFORE latching or refreshing the deadline: a forged pre-latch
+    // ANNOUNCE (empty file, out-of-range chunk) must be ignored like any junk, not
+    // exit the receiver or hold it alive. Mirrors the same-session guard above.
+    if (!Protocol::announceInRange(announced, incoming_cs, MAX_FILE_LENGTH)) {
+        std::cerr << "Warning: ignoring announcement with invalid file/chunk size"
+                  << std::endl;
+        return true;
+    }
 
-    if (!announceValid(announced, incoming_cs, exit_code)) return false;
+    // Only a valid packet from our sender pushes the timeout out, so a noisy or
+    // hostile host cannot keep the receiver alive forever.
+    refreshDeadline();
 
     session_id   = incoming_sid;
     have_session = true;

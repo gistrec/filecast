@@ -192,6 +192,11 @@ TEST(Protocol, TotalPartsBoundaries) {
     EXPECT_EQ(Protocol::totalParts(1500, 1500), 1u);
     EXPECT_EQ(Protocol::totalParts(1501, 1500), 2u);
     EXPECT_EQ(Protocol::totalParts(3000, 1500), 2u);
+    // Max v3 wire file size: file_length + chunk_size must not overflow, or a
+    // 32-bit size_t wraps the count to ~0. A real guard on 32-bit builds; on a
+    // 64-bit size_t it can't overflow, so here it just pins the expected count.
+    EXPECT_EQ(Protocol::totalParts(0xFFFFFFFFu, 64), 67108864u);
+    EXPECT_EQ(Protocol::totalParts(0xFFFFFFFFu, 65489), 65584u);
 }
 
 TEST(Protocol, ExpectedPartSize) {
