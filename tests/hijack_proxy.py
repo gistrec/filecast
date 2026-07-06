@@ -1,24 +1,11 @@
 #!/usr/bin/env python3
 """Session-hijack UDP proxy for exercising the same-session ANNOUNCE guard."""
 #
-# Like corrupt_proxy.py this runs two unidirectional proxies in one process:
-#
-#   * Forward direction:  listen-fwd  -> target-fwd  (sender -> receiver path)
-#   * Backward direction: listen-back -> target-back (receiver -> sender path)
-#
-# It forwards every real packet byte-for-byte, but models a LAN attacker who has
-# sniffed the cleartext session id out of a broadcast: once the legitimate
-# ANNOUNCE has passed and the transfer is under way (after the first TRANSFER),
-# it injects ONE forged ANNOUNCE straight at the receiver. The forgery reuses the
-# real session id — so it slips past the receiver's different-session gate — but
-# carries a different file_length, sha256 and name.
-#
-# Against an unfixed receiver this re-latches the session: the .part is truncated,
-# the parts bitmap is wiped and the expected hash is swapped for the attacker's,
-# so the transfer can never complete/verify (the receiver times out or reports a
-# checksum mismatch). Against the fixed receiver the forged ANNOUNCE is refused,
-# the real transfer finishes and the file verifies. The injection is fired exactly
-# once, after the first data-bearing TRANSFER, so the outcome is deterministic.
+# Like corrupt_proxy.py, forwards every real packet byte-for-byte but models a LAN
+# attacker who sniffed the cleartext session id: after the first TRANSFER it
+# injects ONE forged ANNOUNCE that reuses the session id (so it passes the
+# different-session gate) yet claims a different file_length/sha256/name. Fired
+# exactly once, so the outcome is deterministic.
 
 import argparse
 import socket

@@ -1,20 +1,11 @@
 #!/usr/bin/env bash
 #
-# Session-hijack end-to-end test: run a real transfer through a proxy that, once
-# the transfer is under way, injects ONE forged ANNOUNCE reusing the legitimate
-# (cleartext) session id but claiming a different file_length, sha256 and name.
-#
-# This pins the same-session ANNOUNCE guard in handleAnnounce. On a receiver that
-# re-latches such a packet, the forgery truncates the .part, wipes the parts
-# bitmap and swaps in the attacker's hash — so an almost-complete transfer either
-# never finishes or fails its checksum (a one-packet, repeatable reset, and a way
-# to make injected bytes verify under a chosen name). A receiver that honours the
-# guard refuses the forgery and the real transfer completes and verifies:
-#
-#   * the receiver must exit 0 and report "sha256 verified",
-#   * the output file must match the source byte-for-byte,
-#   * no "evil" file (the forged name) may appear, and
-#   * the receiver must have logged that it ignored the conflicting announcement.
+# Session-hijack end-to-end test: a proxy injects one forged ANNOUNCE mid-transfer
+# reusing the legitimate session id but claiming a different file_length/sha256/
+# name. This pins the same-session ANNOUNCE guard in handleAnnounce: a receiver
+# that re-latched it would reset/hijack the transfer, so we require the receiver
+# to refuse the forgery, exit 0, report "sha256 verified", produce a byte-identical
+# output, write no "evil" file, and log that it ignored the conflicting ANNOUNCE.
 #
 # Run via:
 #   ctest --test-dir build --output-on-failure
