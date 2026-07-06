@@ -156,9 +156,31 @@ TEST(Protocol, SanitizeNameRejectsDangerous) {
     EXPECT_EQ(Protocol::sanitizeName("LPT9"), "file.out");
 }
 
+TEST(Protocol, SanitizeNameRejectsControlBytes) {
+    using std::string;
+    // Embedded NUL: without this guard the name passes every other check but the
+    // on-disk path truncates at the NUL ("evil"), diverging from what we print.
+    EXPECT_EQ(Protocol::sanitizeName(string("evil\0.txt", 9)), "file.out");
+    EXPECT_EQ(Protocol::sanitizeName(string("\0", 1)), "file.out");
+    // ANSI escape / DEL / other control bytes would inject into the receiver's
+    // terminal when the name is echoed; reject them all.
+    EXPECT_EQ(Protocol::sanitizeName("\033[2J\033[Hpwned"), "file.out");  // ESC (0x1b)
+    EXPECT_EQ(Protocol::sanitizeName("bell\a.txt"), "file.out");          // BEL (0x07)
+    EXPECT_EQ(Protocol::sanitizeName("line\nbreak.txt"), "file.out");     // LF  (0x0a)
+    EXPECT_EQ(Protocol::sanitizeName("tab\tchar.txt"), "file.out");       // TAB (0x09)
+    EXPECT_EQ(Protocol::sanitizeName(string("del\x7f.txt", 8)), "file.out"); // DEL (0x7f)
+    // A control byte living only in a stripped directory component must not
+    // condemn an otherwise-clean base name.
+    EXPECT_EQ(Protocol::sanitizeName(string("dir\n/clean.txt", 14)), "clean.txt");
+}
+
 TEST(Protocol, SanitizeNameAllowsNormalNames) {
     EXPECT_EQ(Protocol::sanitizeName("console.log"), "console.log");  // not a device
     EXPECT_EQ(Protocol::sanitizeName("com10.bin"), "com10.bin");      // COM10 is not reserved
+    // Bytes >= 0x20 stay put — spaces, punctuation and high/UTF-8 bytes are fine.
+    EXPECT_EQ(Protocol::sanitizeName("my report (final).pdf"), "my report (final).pdf");
+    EXPECT_EQ(Protocol::sanitizeName("\xD1\x84\xD0\xB0\xD0\xB9\xD0\xBB.txt"),
+              "\xD1\x84\xD0\xB0\xD0\xB9\xD0\xBB.txt");               // UTF-8 "файл.txt"
 }
 
 TEST(Protocol, TotalPartsBoundaries) {
