@@ -37,8 +37,8 @@ FLOOD_PID=""
 PROC_PID=""
 
 cleanup() {
-    [ -n "$PROC_PID"  ] && kill "$PROC_PID"  2>/dev/null || true
-    [ -n "$FLOOD_PID" ] && kill "$FLOOD_PID" 2>/dev/null || true
+    if [ -n "$PROC_PID"  ]; then kill "$PROC_PID"  2>/dev/null || true; fi
+    if [ -n "$FLOOD_PID" ]; then kill "$FLOOD_PID" 2>/dev/null || true; fi
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
