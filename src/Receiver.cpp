@@ -42,11 +42,8 @@ void installSignalHandlers() {
 #endif
 }
 
-// Hard upper bound imposed by the v3 wire format: file_size is a 4-byte field, so
-// the largest representable size is 2^32 - 1. Written as 0xFFFFFFFF (not 4 GiB) so
-// the constant is exact and still fits size_t on a 32-bit build — 4ULL*1024^3 would
-// wrap to 0 there and make announceInRange reject every non-empty file. Disk-backed
-// storage removes the RAM pressure; representing more needs a protocol bump.
+// Hard upper bound from the v3 wire format's 4-byte file_size field. 0xFFFFFFFF
+// (not 4ULL*1024^3, which wraps to 0 on a 32-bit size_t) keeps the limit exact.
 constexpr size_t MAX_FILE_LENGTH = 0xFFFFFFFFu; // 4 GiB - 1 (v3 wire limit)
 
 // Session the receiver is currently bound to. The sender stamps a random id into
@@ -717,10 +714,8 @@ int checkParts() {
         // would be a 512 MB allocation on top of the registry it came from.
         for (size_t index = 0; index < total; ++index) {
             if (parts.has(index)) continue;
-            // Re-requesting a large missing set — especially with --rate/--delay-ms
-            // pacing each send — can take many seconds. Check the interrupt and the
-            // wall-clock deadline inside the burst too, not just in the outer loop,
-            // so Ctrl+C is honoured promptly and the deadline can't be blown past.
+            // Honour Ctrl+C and the deadline inside the burst too: a large paced
+            // re-request set can otherwise take many unresponsive seconds.
             if (g_interrupted) return onInterrupt(buffer);
             if (deadlineExpired()) break;
             Protocol::writeHeader(buffer, Protocol::Type::Resend, session_id);
@@ -854,24 +849,17 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
         return true;
     }
 
-    // Validate the announced sizes BEFORE latching or pushing the deadline out. A
-    // forged or garbled ANNOUNCE (empty file, out-of-range chunk) must be ignored
-    // like any other unrecognised traffic — not kill a receiver still waiting for
-    // its real sender, and not keep it alive by refreshing the deadline. This
-    // mirrors the same-session guard above, which already drops a conflicting
-    // ANNOUNCE without exiting; the pre-latch window was the one path that still let
-    // a single crafted packet terminate the receiver. The chunk lower bound also
-    // caps the part count, so a forged tiny chunk cannot balloon the parts bitmap.
+    // Validate BEFORE latching or refreshing the deadline: a forged pre-latch
+    // ANNOUNCE (empty file, out-of-range chunk) must be ignored like any junk, not
+    // exit the receiver or hold it alive. Mirrors the same-session guard above.
     if (!Protocol::announceInRange(announced, incoming_cs, MAX_FILE_LENGTH)) {
         std::cerr << "Warning: ignoring announcement with invalid file/chunk size"
                   << std::endl;
         return true;
     }
 
-    // Only a recognised, valid packet from our sender pushes the timeout out.
-    // Unrecognised traffic (stray broadcasts, other receivers' RESENDs, garbage)
-    // deliberately does not, so the deadline stays reachable and a hostile or noisy
-    // host cannot keep the receiver alive forever.
+    // Only a valid packet from our sender pushes the timeout out, so a noisy or
+    // hostile host cannot keep the receiver alive forever.
     refreshDeadline();
 
     session_id   = incoming_sid;

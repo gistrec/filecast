@@ -131,9 +131,8 @@ bool validateNumericFlags(const CliOptions& opt) {
         std::cerr << "Error: --ttl must be greater than 0" << std::endl;
         return false;
     }
-    // Cap it far below where ttl*10 seconds (the sender's resend-phase deadline)
-    // would overflow a steady_clock time_point in nanoseconds. A day of silence is
-    // already orders of magnitude more than any real transfer needs.
+    // Cap it so ttl*10s (the sender's resend-phase deadline) can't overflow a
+    // steady_clock time_point; a day of silence is already far more than needed.
     if (opt.ttl > 86400) {
         std::cerr << "Error: --ttl must be at most 86400 (24h)" << std::endl;
         return false;
