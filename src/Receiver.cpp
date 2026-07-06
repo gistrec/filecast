@@ -222,6 +222,10 @@ bool hashPartFile(uint8_t out[32]) {
 }
 
 void removePartFiles() {
+    // part_path is set as soon as openPartFile() runs, which only happens while
+    // handling an ANNOUNCE. Empty means no part file opened this run — fileName
+    // is still "", so removing fileName+".part" would nuke a bare ".part" in cwd.
+    if (part_path.empty()) return;
     closePartFile(false);
     std::remove(snapshotPartPath().c_str());
     std::remove((fileName + ".part.idx").c_str());

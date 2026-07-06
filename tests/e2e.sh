@@ -317,5 +317,35 @@ run_resume_test() {
 }
 run_resume_test
 
+# Timeout before ANNOUNCE: a `receive` with no output path that times out before
+# any sender appears must not touch the cwd. Previously fileName was still empty
+# at that point, so the cleanup removed a bare ".part"/".part.idx" — deleting an
+# unrelated transfer's files. Plant decoys named exactly that and assert they
+# survive (exit 2, no output produced).
+run_timeout_no_sender_test() {
+    local dir="$WORKDIR/timeout-no-sender"
+    mkdir -p "$dir"
+    echo "unrelated part data" > "$dir/.part"
+    echo "unrelated idx data"  > "$dir/.part.idx"
+
+    echo "==> [no-sender] receive with no output path, no sender, short ttl"
+    local rc=0
+    ( cd "$dir" && exec "$BINARY" receive --to 127.0.0.1 \
+          --bind-port 33413 --port 33414 --ttl 1 --delay-ms 0 > recv.log 2>&1 ) || rc=$?
+
+    if [ "$rc" -ne 2 ]; then
+        echo "FAIL: [no-sender] expected receiver exit 2, got $rc"
+        tail -5 "$dir/recv.log"
+        return 1
+    fi
+    if [ ! -f "$dir/.part" ] || [ ! -f "$dir/.part.idx" ]; then
+        echo "FAIL: [no-sender] cwd .part/.part.idx were deleted by the timeout cleanup"
+        ls -a "$dir"
+        return 1
+    fi
+    echo "PASS: [no-sender] timeout before ANNOUNCE left the cwd untouched"
+}
+run_timeout_no_sender_test
+
 echo
 echo "All E2E tests passed."
