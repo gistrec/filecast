@@ -222,6 +222,10 @@ bool hashPartFile(uint8_t out[32]) {
 }
 
 void removePartFiles() {
+    // part_path is empty until an ANNOUNCE opens the part file. Bail out then:
+    // with no ANNOUNCE fileName is still "", so removing fileName+".part" would
+    // delete a bare ".part"/".part.idx" in the cwd — another transfer's files.
+    if (part_path.empty()) return;
     closePartFile(false);
     std::remove(snapshotPartPath().c_str());
     std::remove((fileName + ".part.idx").c_str());
