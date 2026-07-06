@@ -158,8 +158,12 @@ bool closePartFile(bool flush) {
 }
 
 #if defined(_WIN32) || defined(_WIN64)
-// Refuse a reparse point/symlink or hardlink; needs the handle opened with
-// FILE_FLAG_OPEN_REPARSE_POINT and without truncation.
+// Win32 counterpart of the POSIX guard below: refuse a reparse point (symlink or
+// junction) or a hardlink so our writes can't reach a linked victim. Relies on the
+// handle being opened with FILE_FLAG_OPEN_REPARSE_POINT (the link itself) and
+// without truncation. The DIRECTORY bit is defence in depth: CreateFileA without
+// FILE_FLAG_BACKUP_SEMANTICS won't return a directory handle, but rejecting it
+// keeps the guard honest if that ever changes.
 bool isLoneRegularFile(HANDLE h) {
     BY_HANDLE_FILE_INFORMATION info;
     if (!GetFileInformationByHandle(h, &info)) return false;
