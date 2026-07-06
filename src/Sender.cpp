@@ -225,7 +225,9 @@ bool serveResends(size_t total_parts, size_t& resent) {
         size_t part = Protocol::getU32(buffer + Protocol::HEADER_SIZE);
         if (part >= total_parts) continue;
 
-        auto epoch    = std::chrono::system_clock::now().time_since_epoch();
+        // Monotonic clock: a backward NTP step must not stall RESENDs by making
+        // (duration - sent_part[part]) negative for already-served parts.
+        auto epoch    = std::chrono::steady_clock::now().time_since_epoch();
         int64_t duration = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
 
         ttl = ttl_max;
