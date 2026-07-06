@@ -202,11 +202,11 @@ TEST(Protocol, ExpectedPartSize) {
 TEST(Protocol, AnnounceInRange) {
     const size_t maxFile = 4ULL * 1024 * 1024 * 1024;
     EXPECT_TRUE(Protocol::announceInRange(1, 64, maxFile));
-    EXPECT_TRUE(Protocol::announceInRange(maxFile, 65507, maxFile));
+    EXPECT_TRUE(Protocol::announceInRange(maxFile, 65489, maxFile));   // MAX_CHUNK (fits a UDP datagram)
     EXPECT_FALSE(Protocol::announceInRange(0, 1500, maxFile));         // empty file
     EXPECT_FALSE(Protocol::announceInRange(maxFile + 1, 1500, maxFile)); // too big
     EXPECT_FALSE(Protocol::announceInRange(1000, 63, maxFile));        // chunk too small (OOM guard)
-    EXPECT_FALSE(Protocol::announceInRange(1000, 65508, maxFile));     // chunk too big
+    EXPECT_FALSE(Protocol::announceInRange(1000, 65490, maxFile));     // chunk too big (TRANSFER_HEADER would overflow the datagram)
 }
 
 // --- Progress formatting ----------------------------------------------------

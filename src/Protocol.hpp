@@ -108,10 +108,14 @@ inline Parse parseHeader(const char* buf, size_t length, Header& h) {
     return (h.version == VERSION) ? Parse::Ok : Parse::BadVersion;
 }
 
+// Largest IPv4 UDP payload; a TRANSFER datagram is TRANSFER_HEADER + chunk, so
+// the chunk must stay TRANSFER_HEADER below it or sendto() hits EMSGSIZE.
+constexpr size_t MAX_UDP_PAYLOAD = 65507;
+
 // Valid chunk size range (the sender's --mtu bounds). The lower bound also caps
 // the part count, so a forged tiny chunk cannot blow up the receiver.
 constexpr size_t MIN_CHUNK = 64;
-constexpr size_t MAX_CHUNK = 65507;
+constexpr size_t MAX_CHUNK = MAX_UDP_PAYLOAD - TRANSFER_HEADER;  // 65489
 
 inline size_t totalParts(size_t file_length, size_t chunk_size) {
     if (chunk_size == 0) return 0;  // guard the reusable helper against misuse
