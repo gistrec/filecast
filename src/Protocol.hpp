@@ -137,9 +137,11 @@ inline bool announceInRange(size_t announced, size_t chunk, size_t maxFile) {
 // an extension — opening it writes to a device, not a file.
 inline bool isReservedDeviceName(const std::string& name) {
     std::string stem = name.substr(0, name.find('.'));
-    // Windows strips trailing spaces and dots before matching, so "con ",
-    // "nul.", "com1 ." also resolve to devices.
-    stem.erase(stem.find_last_not_of(" .") + 1);
+    // The extension (everything from the first '.') is already dropped above, so
+    // `stem` holds only the base name and can never contain a dot. Windows also
+    // strips trailing spaces from that base before matching, so "con ", "com1 "
+    // and the "com1 " base of "com1 .txt" still resolve to devices — trim them.
+    stem.erase(stem.find_last_not_of(' ') + 1);
     std::transform(stem.begin(), stem.end(), stem.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL") return true;
