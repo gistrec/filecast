@@ -414,6 +414,43 @@ run_hardlink_part_test() {
 }
 run_hardlink_part_test
 
+# Pre-planted symlink: O_NOFOLLOW (POSIX) and FILE_FLAG_OPEN_REPARSE_POINT +
+# GetFileInformationByHandle (Windows) already refuse a symlinked <name>.part, so
+# pin that guarantee against regressions. A local attacker who can write the cwd
+# could symlink the predictable .part name onto a victim file and have the
+# receiver's truncate/writes clobber it. Plant such a symlink and assert the
+# receiver refuses (non-zero exit) and leaves the victim byte-for-byte intact.
+run_symlink_part_test() {
+    local dir="$WORKDIR/symlink-part"
+    mkdir -p "$dir"
+    dd if=/dev/urandom of="$dir/src.bin" bs=1024 count=50 status=none
+    printf 'precious victim data that must not be truncated' > "$dir/victim"
+    cp "$dir/victim" "$dir/victim.expected"
+    ln -s "$dir/victim" "$dir/out.bin.part"   # symlink at the predictable .part name
+
+    echo "==> [symlink] receive with a symlinked out.bin.part planted"
+    local rc=0
+    ( cd "$dir" && exec "$BINARY" receive out.bin --to 127.0.0.1 \
+          --bind-port 33419 --port 33420 --ttl 5 --delay-ms 0 > recv.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/src.bin" --to 127.0.0.1 --bind-port 33420 --port 33419 \
+              --ttl 2 --delay-ms 0 > "$dir/send.log" 2>&1 || true
+    wait "$rpid" || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: [symlink] receiver accepted a symlinked .part (exit 0)"
+        tail -5 "$dir/recv.log"
+        return 1
+    fi
+    if ! cmp -s "$dir/victim.expected" "$dir/victim"; then
+        echo "FAIL: [symlink] victim file was corrupted through the symlink"
+        return 1
+    fi
+    echo "PASS: [symlink] refused the pre-planted symlink, victim intact"
+}
+run_symlink_part_test
+
 # Many parts: a tiny MTU splits even a small file into hundreds of parts, so this
 # drives the received-parts bitmap (set/has/count) across a large index range and
 # checks reassembly stays byte-exact. The bitmap replaced an std::set that scaled
