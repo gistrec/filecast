@@ -157,7 +157,16 @@ bool closePartFile(bool flush) {
     #endif
 }
 
-#if !defined(_WIN32) && !defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64)
+// Refuse a reparse point/symlink or hardlink; needs the handle opened with
+// FILE_FLAG_OPEN_REPARSE_POINT and without truncation.
+bool isLoneRegularFile(HANDLE h) {
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(h, &info)) return false;
+    if (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) return false;
+    return info.nNumberOfLinks == 1;
+}
+#else
 // O_NOFOLLOW rejects a symlink but not a pre-planted hardlink; refuse anything
 // that isn't a lone regular file so our writes can't reach a linked victim.
 bool isLoneRegularFile(int fd) {
@@ -173,10 +182,17 @@ bool openPartFile(bool reuse_existing) {
     storage_failed = false;
 
     #if defined(_WIN32) || defined(_WIN64)
-    DWORD disposition = reuse_existing ? OPEN_EXISTING : CREATE_ALWAYS;
+    // OPEN_ALWAYS avoids truncating and FILE_FLAG_OPEN_REPARSE_POINT opens the
+    // link itself, so isLoneRegularFile can refuse it before any write.
+    DWORD disposition = reuse_existing ? OPEN_EXISTING : OPEN_ALWAYS;
     part_handle = CreateFileA(part_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                              disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+                              disposition, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (part_handle == INVALID_HANDLE_VALUE) return false;
+
+    if (!isLoneRegularFile(part_handle)) {
+        closePartFile(false);
+        return false;
+    }
 
     LARGE_INTEGER pos;
     if (reuse_existing) {
