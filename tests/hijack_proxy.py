@@ -23,8 +23,8 @@ HEADER_SIZE = 10
 ANNOUNCE_FIXED = HEADER_SIZE + 42  # header + size(4) + chunk(4) + hash(32) + name_len(2)
 
 # The forged file the attacker claims. Length/chunk are overridable so the test
-# can also forge values announceValid() rejects (empty file, out-of-range chunk),
-# which the guard must drop before they become a fatal error.
+# can also forge values the announce range-check rejects (empty file, out-of-range
+# chunk), which the same-session guard must drop before that check runs.
 FORGED_NAME = b"evil"
 FORGED_HASH = bytes([0xAB]) * 32
 

@@ -249,12 +249,16 @@ bool serveResends(size_t total_parts, size_t& resent) {
         auto result = recvfrom(_socket, buffer, 2 * mtu, 0,
                                reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
-        // No incoming requests for a while - resend FINISH and decrement ttl.
-        if (result <= 0) {
+        // A timeout (SO_RCVTIMEO) returns < 0: no requests this round, so re-announce
+        // FINISH and count ttl down. A zero-length datagram is a real UDP event, not
+        // silence — ignore it, so a peer spraying empty packets can't drain the
+        // resend phase early (mirrors the receiver's length==0 handling).
+        if (result < 0) {
             ttl--;
             sendFinish();
             continue;
         }
+        if (result == 0) continue;
 
         // The socket hears our own TRANSFER/FINISH broadcasts too; only RESENDs
         // for our session and current protocol version matter here. A foreign

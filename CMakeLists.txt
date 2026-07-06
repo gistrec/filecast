@@ -173,8 +173,23 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # Pre-latch variant: two forged ANNOUNCEs (empty file, out-of-range
+            # chunk) are fired at a receiver before the real sender starts. A
+            # receiver that hasn't latched a session yet must ignore them and keep
+            # waiting, then complete the real transfer — pinning that a single
+            # crafted datagram can't kill `receive` in its pre-latch window (the
+            # post-latch case is covered by e2e_hijack). Needs Python 3.
+            add_test(
+                NAME e2e_prelatch
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_prelatch.sh
+            )
+            set_tests_properties(e2e_prelatch PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
-            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack and e2e_flood tests")
+            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack, e2e_flood and e2e_prelatch tests")
         endif()
     endif()
 endif()
