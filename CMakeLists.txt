@@ -85,8 +85,20 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # Corrupting variant: a Python UDP proxy flips one payload byte so the
+            # reassembled file fails its SHA-256, exercising verifyAndWrite's
+            # checksum-mismatch cleanup. Also needs Python 3.
+            add_test(
+                NAME e2e_corrupt
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_corrupt.sh
+            )
+            set_tests_properties(e2e_corrupt PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
-            message(STATUS "Python 3 not found — skipping e2e_lossy test")
+            message(STATUS "Python 3 not found — skipping e2e_lossy and e2e_corrupt tests")
         endif()
     endif()
 endif()
