@@ -144,6 +144,19 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # Same proxy, but the forged ANNOUNCE claims an out-of-range chunk
+            # size. That packet would *fail* announceValid(); the guard must drop
+            # it first, so an invalid forgery cannot terminate the receiver (the
+            # one-packet DoS that survived when the guard ran after validation).
+            add_test(
+                NAME e2e_hijack_invalid
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_hijack.sh
+            )
+            set_tests_properties(e2e_hijack_invalid PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE};FORGE_CHUNK=1"
+                TIMEOUT 120
+            )
         else()
             message(STATUS "Python 3 not found — skipping e2e_lossy and e2e_corrupt tests")
         endif()

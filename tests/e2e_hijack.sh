@@ -7,17 +7,29 @@
 # to refuse the forgery, exit 0, report "sha256 verified", produce a byte-identical
 # output, write no "evil" file, and log that it ignored the conflicting ANNOUNCE.
 #
+# FORGE_LENGTH / FORGE_CHUNK select what the forgery claims. The default is a
+# well-formed conflicting file; setting FORGE_CHUNK to an out-of-range value (or
+# FORGE_LENGTH=0) forges an ANNOUNCE that would *fail* the receiver's range check.
+# That case matters because the guard has to drop it before announceValid() runs,
+# otherwise the forged packet terminates the receiver -- a one-packet DoS.
+#
 # Run via:
 #   ctest --test-dir build --output-on-failure
 #
 # Or directly:
 #   BINARY=build/filecast bash tests/e2e_hijack.sh
+#   BINARY=build/filecast FORGE_CHUNK=1 bash tests/e2e_hijack.sh   # invalid forgery
 #
 set -euo pipefail
 
 BINARY="${BINARY:-./filecast}"
 PYTHON="${PYTHON:-python3}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# What the injected forgery claims. Defaults describe a valid-but-conflicting
+# file; override to forge values the receiver's announceValid() would reject.
+FORGE_LENGTH="${FORGE_LENGTH:-4096}"
+FORGE_CHUNK="${FORGE_CHUNK:-1400}"
 
 if [ ! -x "$BINARY" ]; then
     echo "Error: $BINARY not found or not executable. Build first." >&2
@@ -64,10 +76,11 @@ proxy_log="$dir/proxy.log"
 echo "==> generating 500 KiB file (a forged same-session ANNOUNCE will be injected)"
 dd if=/dev/urandom of="$src" bs=1024 count=500 status=none
 
-echo "==> starting hijack proxy"
+echo "==> starting hijack proxy (forge length=$FORGE_LENGTH chunk=$FORGE_CHUNK)"
 "$PYTHON" "$SCRIPT_DIR/hijack_proxy.py" \
     --listen-fwd  "$PROXY_FWD_IN"  --target-fwd  "$RECV_BIND" \
     --listen-back "$PROXY_BACK_IN" --target-back "$SEND_BIND" \
+    --forge-length "$FORGE_LENGTH" --forge-chunk "$FORGE_CHUNK" \
     > "$proxy_log" 2>&1 &
 PROXY_PID=$!
 sleep 0.5  # let the proxy bind both sockets
