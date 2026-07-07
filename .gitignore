@@ -40,7 +40,7 @@
 *.pdb
 
 # Build directories
-build/
+build*/
 out/
 
 # Visual Studio
