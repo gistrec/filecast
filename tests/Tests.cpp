@@ -160,6 +160,16 @@ TEST(Protocol, SanitizeNameRejectsDangerous) {
     EXPECT_EQ(Protocol::sanitizeName("console.log"), "console.log");  // base "console" is not a device
 }
 
+TEST(Protocol, SanitizeNameClampsLength) {
+    // Clamp to MAX_NAME_LEN so "<name>.part" / "<name>.part.idx" stay within
+    // NAME_MAX; otherwise a legit long name — or a crafted over-long ANNOUNCE —
+    // makes the receiver's open()/rename() fail with ENAMETOOLONG.
+    std::string over(500, 'a');
+    EXPECT_EQ(Protocol::sanitizeName(over).size(), Protocol::MAX_NAME_LEN);
+    std::string exact(Protocol::MAX_NAME_LEN, 'b');
+    EXPECT_EQ(Protocol::sanitizeName(exact), exact);
+}
+
 TEST(Protocol, SanitizeNameRejectsControlBytes) {
     using std::string;
     // Embedded NUL: without this guard the name passes every other check but the

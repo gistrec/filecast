@@ -175,11 +175,12 @@ bool sendAnnounce() {
     if (verbose) std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
 
     // Name the receiver saves under unless it was given an explicit output path.
-    // Clamp so the whole ANNOUNCE fits the send buffer (2 * mtu) and the length
-    // field (a byte count well under 2^16).
+    // Clamp so the whole ANNOUNCE fits the send buffer (2 * mtu), the length
+    // field (a byte count well under 2^16), and the receiver's on-disk name cap
+    // (Protocol::MAX_NAME_LEN, which leaves room for the ".part.idx" suffix).
     std::string name = baseName(fileName);
     size_t max_name = static_cast<size_t>(2 * mtu) - Protocol::ANNOUNCE_FIXED;
-    if (max_name > 255) max_name = 255;
+    if (max_name > Protocol::MAX_NAME_LEN) max_name = Protocol::MAX_NAME_LEN;
     if (name.size() > max_name) name.resize(max_name);
 
     Protocol::writeHeader(buffer, Protocol::Type::Announce, session_id);
@@ -301,6 +302,11 @@ bool serveResends(size_t total_parts, size_t& resent) {
             if (!sendPart(part)) return false;
             ++resent;
             ttl = ttl_max;
+            // Pace re-sends on the same clock as the initial pass so --rate (and
+            // --delay-ms) bound the recovery phase too. Without this, a peer that
+            // requests many distinct parts pulls them back at full line rate,
+            // ignoring the sender's chosen rate on a shared LAN.
+            pace();
         }
         // Re-announce completion at most once a second.
         if (duration - lastFinishSendTime >= 1) {

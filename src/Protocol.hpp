@@ -171,9 +171,19 @@ inline bool hasControlChar(const std::string& name) {
     });
 }
 
+// Longest base name the receiver will materialize on disk. It appends the
+// ".part.idx" suffix (9 bytes) to build the resume-snapshot path, and most
+// filesystems cap a single path component at NAME_MAX (255). Keeping the base
+// name at or under this bound means "<name>.part" and "<name>.part.idx" both
+// stay within NAME_MAX, so an otherwise-valid transfer cannot fail open() or
+// rename() with ENAMETOOLONG — whether the long name is legitimate or a crafted
+// over-long ANNOUNCE aimed at a still-waiting receiver.
+constexpr size_t MAX_NAME_LEN = 255 - 9;  // room for the ".part.idx" suffix
+
 // Reduce a sender-supplied name to a safe base name in the working directory:
-// strip directories, and reject traversal, ':' (Windows drive-relative / ADS),
-// control/NUL bytes and reserved device names by falling back to "file.out".
+// strip directories, reject traversal, ':' (Windows drive-relative / ADS),
+// control/NUL bytes and reserved device names by falling back to "file.out",
+// then clamp the length so the ".part"/".part.idx" paths fit NAME_MAX.
 inline std::string sanitizeName(const std::string& raw) {
     size_t slash = raw.find_last_of("/\\");
     std::string name = (slash == std::string::npos) ? raw : raw.substr(slash + 1);
@@ -181,6 +191,7 @@ inline std::string sanitizeName(const std::string& raw) {
     if (name.find(':') != std::string::npos) return "file.out";
     if (hasControlChar(name)) return "file.out";
     if (isReservedDeviceName(name)) return "file.out";
+    if (name.size() > MAX_NAME_LEN) name.resize(MAX_NAME_LEN);
     return name;
 }
 
