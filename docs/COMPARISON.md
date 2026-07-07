@@ -61,10 +61,13 @@ packet-loss recovery, SHA-256 verification, and resume.
 [^filecast-hash]: The SHA-256 is announced over the same unauthenticated
     channel as the data, so it guards against loss and corruption, not
     against a malicious LAN peer — see the Limitations section of the README.
-[^uftp-integrity]: No whole-file hash ([protocol
-    spec](https://uftp-multicast.sourceforge.net/protocol.txt)): integrity
-    relies on NAK-based retransmission, and in encrypted mode (the default
-    since v5.0) every packet is authenticated by the AEAD cipher.
+[^uftp-integrity]: ⚠️ rather than ✅ because there is no application-level
+    whole-file hash ([protocol
+    spec](https://uftp-multicast.sourceforge.net/protocol.txt)): integrity rests
+    on NAK-based retransmission plus UDP checksums, with per-packet cryptographic
+    authentication only when encryption is on. That is the default from v5.0
+    (2020) via the AEAD cipher — as strong as the ✅ tools there — but the 4.x
+    builds some distros still ship leave it off (see [^uftp-crypto]).
 [^udpcast-platforms]: Official Windows binaries exist but were last built in
     December 2021 (v20211207); on macOS it builds from source (portability
     fixes landed in the 2025 release) with no official package.

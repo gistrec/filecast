@@ -150,7 +150,7 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 | `-p, --port`  | `33333`    | 1..65535 | Destination port for outgoing packets |
 | `--bind-port` | `33333`    | 1..65535 | Local port to bind on |
 | `--mtu`       | `1500`     | 64..65489 | Max packet size in bytes (18-byte header keeps the datagram within the 65507-byte UDP limit) |
-| `--ttl`       | `15`       | > 0 | Seconds of silence before giving up |
+| `--ttl`       | `15`       | 1..86400 | Seconds of silence before giving up |
 | `--rate`      | `100`      | > 0 | Target send rate in Mbit/s |
 | `--overwrite` | off        | — | Overwrite an existing output file |
 | `--resume`    | off        | — | Resume an interrupted receive from its `.part` snapshot |
@@ -226,17 +226,21 @@ The full wire format lives in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Resuming an Interrupted Transfer
 
-If a receive is interrupted with Ctrl+C, or times out with parts still missing,
-the receiver saves what it has to `<name>.part` (plus a `<name>.part.idx` record
-of which parts arrived). Re-run with `--resume` and it picks up where it left
-off — the transfer is matched by the file's SHA-256, so it works even if the
-sender is restarted (a new session):
+Start the receive with `--resume`. If it is then interrupted with Ctrl+C, or
+times out with parts still missing, the receiver keeps what it has in
+`<name>.part` (plus a `<name>.part.idx` record of which parts arrived) instead of
+discarding it, and a re-run picks up where it left off — the transfer is matched
+by the file's SHA-256, so it works even if the sender is restarted (a new
+session):
 
 ```sh
 filecast receive album.zip --resume
 ```
 
-The snapshot is deleted once the file completes and its checksum verifies.
+`--resume` is what enables the snapshot, so it has to be set on the *first* run
+too, not just the retry: a plain `filecast receive` deletes its partial file when
+it is interrupted. The snapshot is removed once the file completes and its
+checksum verifies.
 
 ## Limitations
 
