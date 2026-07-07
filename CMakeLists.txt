@@ -10,8 +10,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # Version string baked into the binary; the release workflow overrides this
-# from the git tag (e.g. -DFILECAST_VERSION=v1.0.0).
-set(FILECAST_VERSION "1.0.0" CACHE STRING "Version string for --version output")
+# from the git tag (e.g. -DFILECAST_VERSION=v1.0.1).
+set(FILECAST_VERSION "1.0.1" CACHE STRING "Version string for --version output")
 
 # --- main executable ---------------------------------------------------------
 
