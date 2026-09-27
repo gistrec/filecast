@@ -264,7 +264,11 @@ filecast receive album.zip --resume
 `--resume` is what enables the snapshot, so it has to be set on the *first* run
 too, not just the retry: a plain `filecast receive` deletes its partial file when
 it is interrupted. The snapshot is removed once the file completes and its
-checksum verifies.
+checksum verifies, and nothing is kept when no part arrived at all.
+
+If the index cannot be written, the received bytes are still kept in
+`<name>.part` and the receiver says so; the next run then starts over rather
+than resuming.
 
 ## Limitations
 

@@ -117,6 +117,15 @@ int part_fd = -1;
 int durableSync(int fd);
 #endif
 
+// unlink/DeleteFile, unlike std::remove, refuse a directory planted at the name.
+void unlinkFile(const std::string& path) {
+    #if defined(_WIN32) || defined(_WIN64)
+    DeleteFileA(path.c_str());
+    #else
+    unlink(path.c_str());
+    #endif
+}
+
 // Received-parts registry: one bit per part instead of an std::set<size_t>. A
 // set cost ~48 bytes per stored part, so a 4 GiB file at a 64-byte chunk (67M
 // parts) needed 3+ GB of RAM; the bitmap needs 8 MB. `count` mirrors the number
@@ -464,26 +473,48 @@ int finalizeVerifiedPart(const std::string& target) {
     }
 }
 
-// Write len bytes to `path` (stable name, truncating). On POSIX O_NOFOLLOW
-// keeps a planted symlink from being followed. Returns false on I/O error.
+// Write len bytes durably and atomically: a fresh temp beside the target,
+// flushed, then renamed over it. Written in place, a crash — the event
+// --resume exists for — could leave a half-written index whose header still
+// matched, and the next run would trust parts it never received. The temp is
+// unlinked first (so a planted symlink is removed, not followed) and checked
+// for links like the .part file. Returns false leaving the old index in place.
 bool writeRawFile(const std::string& path, const char* data, size_t len) {
+    // Same length as the index itself, not path + ".tmp": MAX_NAME_LEN leaves
+    // room for ".part.idx" and nothing more, so a longer temp name would fail
+    // open() with ENAMETOOLONG on every long-named transfer.
+    std::string tmp = path;
+    tmp.back() = '~';
+
     #if defined(_WIN32) || defined(_WIN64)
-    std::ofstream out(path, std::ofstream::binary | std::ofstream::trunc);
-    if (!out.is_open()) return false;
-    out.write(data, static_cast<std::streamsize>(len));
-    out.close();
-    return static_cast<bool>(out);
-    #else
-    // No O_TRUNC: refuse a pre-planted hardlink (isLoneRegularFile) before
-    // truncating, so we can't wipe the linked victim.
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_NOFOLLOW, 0644);
-    if (fd < 0) return false;
-    if (!isLoneRegularFile(fd) || ftruncate(fd, 0) != 0) {
-        close(fd);
+    DeleteFileA(tmp.c_str());
+    HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = isLoneRegularFile(h);
+    for (size_t off = 0; ok && off < len; ) {
+        DWORD chunk = (len - off > 0x40000000u) ? 0x40000000u
+                                                : static_cast<DWORD>(len - off);
+        DWORD wrote = 0;
+        if (!WriteFile(h, data + off, chunk, &wrote, nullptr) || wrote == 0) {
+            ok = false;
+            break;
+        }
+        off += wrote;
+    }
+    if (ok && !FlushFileBuffers(h)) ok = false;
+    if (!CloseHandle(h)) ok = false;
+    if (!ok || !finalizeReplace(tmp, path)) {
+        DeleteFileA(tmp.c_str());
         return false;
     }
-    bool ok = true;
-    for (size_t off = 0; off < len; ) {
+    return true;
+    #else
+    unlink(tmp.c_str());
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (fd < 0) return false;
+    bool ok = isLoneRegularFile(fd);
+    for (size_t off = 0; ok && off < len; ) {
         ssize_t w = write(fd, data + off, len - off);
         if (w < 0) {
             if (errno == EINTR) continue;  // interrupted by a signal — retry
@@ -496,8 +527,13 @@ bool writeRawFile(const std::string& path, const char* data, size_t len) {
         }
         off += static_cast<size_t>(w);
     }
+    if (ok && durableSync(fd) != 0) ok = false;
     if (close(fd) != 0) ok = false;
-    return ok;
+    if (!ok || !finalizeReplace(tmp, path)) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    return true;
     #endif
 }
 
@@ -534,16 +570,26 @@ bool readRawFile(const std::string& path, char* out, size_t max, size_t& got) {
 // snapshot header: "FCIDX1"+NUL(7) + sha256(32) + file_length(8) + chunk(4).
 constexpr size_t SNAPSHOT_HEADER = 51;
 
+// What came of trying to keep the partial transfer on disk.
+enum class Snapshot {
+    Saved,        // .part flushed and .part.idx written: a later --resume works
+    IndexFailed,  // .part flushed, index not written: the bytes are still good
+    NotSaved,     // nothing worth keeping, or the bytes never reached the disk
+};
+
 // Flush the partial <name>.part file and persist a bitmap of received parts to
 // <name>.part.idx, so a later --resume run keyed on the file's SHA-256 can pick
-// up where this one left off. Best-effort: a failure only means no resume.
-// Gated on --resume so a plain receive never leaves surprise .part files behind
-// (nor pays the synchronous whole-buffer write) when interrupted.
-bool saveSnapshot() {
-    if (!resume || !storage_ready || !have_session) return false;
+// up where this one left off. Gated on --resume so a plain receive never leaves
+// surprise .part files behind when interrupted.
+Snapshot saveSnapshot() {
+    if (!resume || !storage_ready || !have_session) return Snapshot::NotSaved;
+    // Nothing received: the snapshot would be a full-size preallocated .part
+    // and an all-zero bitmap, so one announcement then silence left a file the
+    // size of the whole transfer behind. Nothing to resume from, keep nothing.
+    if (parts.size() == 0) return Snapshot::NotSaved;
     // A failed flush leaves the .part unreliable, so don't advertise a snapshot a
     // later --resume would trust with parts that never durably landed.
-    if (!closePartFile(true)) return false;
+    if (!closePartFile(true)) return Snapshot::NotSaved;
     size_t total = totalParts();
     size_t bmSize = (total + 7) / 8;
     std::vector<char> idx(SNAPSHOT_HEADER + bmSize, 0);
@@ -553,7 +599,27 @@ bool saveSnapshot() {
     Utils::writeBytesFromNumber(idx.data() + 47, chunk_size,  4);
     // The registry bitmap already has the on-disk layout, so copy it wholesale.
     memcpy(idx.data() + SNAPSHOT_HEADER, parts.bits.data(), bmSize);
-    return writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
+    return writeRawFile(fileName + ".part.idx", idx.data(), idx.size())
+         ? Snapshot::Saved : Snapshot::IndexFailed;
+}
+
+// Report saveSnapshot()'s outcome on an exit path and clean up after it. An
+// unwritable index must not cost the .part: those bytes are already on disk,
+// and deleting them handed a lever to anyone able to plant such an index.
+void reportSnapshot(Snapshot state) {
+    switch (state) {
+        case Snapshot::Saved:
+            std::cerr << "; progress saved (retry with --resume)";
+            break;
+        case Snapshot::IndexFailed:
+            std::cerr << "; received data kept in " << part_path
+                      << " (could not write " << fileName << ".part.idx, so --resume "
+                      << "will start over)";
+            break;
+        case Snapshot::NotSaved:
+            removePartFiles();
+            break;
+    }
 }
 
 // Remove the snapshot once the transfer has completed and been written out.
@@ -597,13 +663,9 @@ bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
 // Snapshot the partial file and clean up after Ctrl+C/SIGTERM. Returns 130.
 int onInterrupt(char* buffer) {
     reporter.finish();
-    bool saved = saveSnapshot();
-    if (saved) {
-        std::cerr << "\nInterrupted; progress saved (retry with --resume)" << std::endl;
-    } else {
-        std::cerr << "\nInterrupted" << std::endl;
-        removePartFiles();
-    }
+    std::cerr << "\nInterrupted";
+    reportSnapshot(saveSnapshot());
+    std::cerr << std::endl;
     delete[] buffer;
     return 130;
 }
@@ -612,14 +674,14 @@ int onInterrupt(char* buffer) {
 // network dropped mid-send). Persist any partial progress — a no-op without
 // --resume or if nothing was received — so a later --resume can finish it, then
 // clean up. Returns 2. Mirrors the checkParts timeout path so both timeouts save.
+// The reason is always printed: with no snapshot to keep — the common case —
+// this used to exit 2 in complete silence.
 int onTimeout(char* buffer) {
     reporter.finish();
-    bool saved = saveSnapshot();
-    if (saved) {
-        std::cerr << "Transfer timed out; progress saved (retry with --resume)" << std::endl;
-    } else {
-        removePartFiles();
-    }
+    std::cerr << "Error: Transfer timed out";
+    if (!have_session) std::cerr << " waiting for a sender";
+    reportSnapshot(saveSnapshot());
+    std::cerr << std::endl;
     delete[] buffer;
     return 2;
 }
@@ -628,10 +690,8 @@ int onTimeout(char* buffer) {
 // caller has already freed its receive buffer. Returns 2.
 int onRecoveryTimeout(size_t missing) {
     reporter.finish();  // clear the bar before the error line
-    bool saved = saveSnapshot();  // keep progress so a later --resume can finish it
     std::cerr << "Error: Transfer timed out with " << missing << " part(s) missing";
-    if (saved) std::cerr << "; progress saved (retry with --resume)";
-    else removePartFiles();
+    reportSnapshot(saveSnapshot());  // keep progress so a later --resume can finish it
     std::cerr << std::endl;
     return 2;
 }
@@ -686,6 +746,9 @@ int verifyAndWrite(double transfer_secs) {
     }
     discardSnapshot();  // transfer complete — the .part snapshot is no longer needed
 
+    // Whole file over the elapsed time: on a resumed run the sender knows
+    // nothing of the snapshot and re-streams every chunk, so that is what
+    // actually crossed the wire while the clock ran.
     double secs = transfer_secs;
     double rate = secs > 0 ? file_length / secs : 0;
     std::cout << "Received " << fileName << " (" << Progress::humanBytes(file_length) << ")";
@@ -812,6 +875,13 @@ bool createPartFresh(int& exit_code) {
     closePartFile(false);
     parts.reset(totalParts());
     received_bytes = 0;
+    // Starting from zero parts, so a leftover index describes bytes this file
+    // does not have; a later --resume matching its header would trust them.
+    // If it cannot be removed (a read-only file on Windows), empty it instead:
+    // tryResume rejects a short index, so it can never be believed again.
+    const std::string idx_path = fileName + ".part.idx";
+    unlinkFile(idx_path);
+    if (fileExists(idx_path)) writeRawFile(idx_path, nullptr, 0);
     if (!openPartFile(false)) {
         std::cerr << "Error: Can't create temporary output file " << snapshotPartPath() << std::endl;
         exit_code = 1;

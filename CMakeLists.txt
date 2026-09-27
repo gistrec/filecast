@@ -200,8 +200,20 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # An unwritable index must not cost the flushed .part, a
+            # zero-part timeout must leave nothing, an idle receive must
+            # say why it exits 2.
+            add_test(
+                NAME e2e_snapshot
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_snapshot.sh
+            )
+            set_tests_properties(e2e_snapshot PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
-            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack, e2e_flood, e2e_prelatch and e2e_lostannounce tests")
+            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack, e2e_flood, e2e_prelatch, e2e_lostannounce and e2e_snapshot tests")
         endif()
     endif()
 endif()
