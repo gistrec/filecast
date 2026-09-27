@@ -1,11 +1,19 @@
 name: Release
 
-# workflow_dispatch runs the full build matrix (a dry run to validate the
-# release configuration); the release job itself only fires on a v* tag.
+# workflow_dispatch runs only the build matrix (a smoke test of the build
+# configuration). The release and winget jobs fire solely on a v* tag push, so
+# a manual dispatch, even one aimed at an existing tag, cannot rebuild and
+# overwrite already-published assets, whose SHA-256 the winget manifest and
+# the homebrew tap pin. (A "Re-run all jobs" on a finished tag push is not
+# blocked by this condition; do not re-run a green release.)
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+
+# Every job gets a read-only GITHUB_TOKEN unless it asks for more (release does).
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -117,7 +125,7 @@ jobs:
 
   release:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -139,7 +147,7 @@ jobs:
           cat checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: artifacts/*
           fail_on_unmatched_files: true
@@ -149,17 +157,38 @@ jobs:
 
   # Publish the Windows build to the Windows Package Manager (winget) by opening
   # a manifest PR against microsoft/winget-pkgs. Skips prereleases (tags with a
-  # '-'). Requires a WINGET_TOKEN repo secret: a classic PAT with public_repo
-  # scope on an account that has forked microsoft/winget-pkgs. Only the Windows
-  # binary is a winget (portable) installer, so the regex matches just that
-  # asset. The package version is the tag with its leading 'v' stripped.
+  # '-'). Only the Windows binary is a winget (portable) installer, so the regex
+  # matches just that asset. The package version is the tag with its leading
+  # 'v' stripped. Two repo secrets:
+  #   WINGET_TOKEN           classic PAT, scope public_repo only, on the account
+  #                          that forked microsoft/winget-pkgs; komac needs a
+  #                          classic token to open the PR upstream.
+  #   WINGET_FORK_SYNC_TOKEN fine-grained PAT, no expiration, restricted to
+  #                          gistrec/winget-pkgs with Contents: write and
+  #                          Workflows: write; used only by the fork-sync step.
   winget:
     needs: release
-    if: github.ref_type == 'tag' && !contains(github.ref_name, '-')
+    if: github.event_name == 'push' && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     steps:
+      # komac creates its PR branch in the fork at upstream's HEAD. When that
+      # brings in .github/workflows/* changes the fork has not seen yet (upstream
+      # edits its workflows every few weeks, and the fork only moves at release
+      # time), GitHub refuses the ref update unless the token may write workflow
+      # files, and WINGET_TOKEN deliberately may not. So sync the fork's master
+      # first via the fork-sync REST endpoint, with a token that is allowed to
+      # but only on that one repo. winget-releaser@v2 predates komac's
+      # `sync-fork` step, hence the explicit call. The JSON reply is logged; if
+      # the job ever fails here, a re-run repeats the sync.
+      - name: Sync winget-pkgs fork with upstream
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_FORK_SYNC_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN" || { echo '::error::WINGET_FORK_SYNC_TOKEN secret is missing'; exit 1; }
+          gh api -X POST repos/gistrec/winget-pkgs/merge-upstream -f branch=master
+
       - name: Submit manifest to winget-pkgs
-        uses: vedantmgoyal9/winget-releaser@v2
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
         with:
           identifier: gistrec.filecast
           installers-regex: 'windows-x86_64\.exe$'
