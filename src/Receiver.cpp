@@ -20,6 +20,7 @@
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>   // open, O_EXCL, O_NOFOLLOW, AT_FDCWD
+#include <poll.h>    // poll (select cannot represent a descriptor >= FD_SETSIZE)
 #include <sys/stat.h>
 #include <unistd.h>  // read, write, close, link, unlink
 #endif
@@ -305,8 +306,10 @@ void removePartFiles() {
 // Validate and store one TRANSFER packet, parsing it from scratch — the packet
 // may come from the main loop or the recovery loop, and full self-validation
 // keeps the two call sites from ever drifting apart. Returns true when a new
-// part was stored.
-bool handleTransfer(const char* buf, int64_t length) {
+// part was stored; `ours` covers any well-formed part of our session, stored or
+// already held, which is what proves the sender is still alive.
+bool handleTransfer(const char* buf, int64_t length, bool& ours) {
+    ours = false;
     Protocol::Header h;
     if (Protocol::parseHeader(buf, static_cast<size_t>(length), h) != Protocol::Parse::Ok) return false;
     if (h.type != Protocol::Type::Transfer) return false;
@@ -317,13 +320,15 @@ bool handleTransfer(const char* buf, int64_t length) {
     size_t size  = Protocol::getU32(buf + Protocol::HEADER_SIZE + 4);
     size_t total = totalParts();
     if (part >= total) return false;
-    if (parts.has(part)) return false;
 
     // For non-final parts size must equal the chunk size; for the final part it
     // must equal the remaining bytes. Anything else is malformed and would
     // either silently zero-pad data or write past the output file.
     if (size != Protocol::expectedPartSize(part, file_length, chunk_size)) return false;
     if (static_cast<size_t>(length) < size + Protocol::TRANSFER_HEADER) return false;
+
+    ours = true;
+    if (parts.has(part)) return false;
 
     if (!writePartAt(part * chunk_size, buf + Protocol::TRANSFER_HEADER, size)) {
         std::cerr << "Error: Failed to write received data to " << part_path << std::endl;
@@ -698,6 +703,48 @@ int verifyAndWrite(double transfer_secs) {
     return 0;
 }
 
+// Zero-timeout readiness check: lets the RESEND burst pick up replies without
+// blocking. POSIX uses poll(), because a process that inherited many open
+// descriptors can get a socket at or above FD_SETSIZE, which FD_SET cannot
+// represent (it writes out of bounds). Winsock's fd_set holds handles, not a
+// descriptor-indexed bitmap, so select() there is fine with one socket.
+bool socketReadable() {
+    #if defined(_WIN32) || defined(_WIN64)
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(_socket, &rd);
+    timeval zero;
+    zero.tv_sec  = 0;
+    zero.tv_usec = 0;
+    return select(0, &rd, nullptr, nullptr, &zero) > 0;  // nfds is ignored by Winsock
+    #else
+    struct pollfd pfd;
+    pfd.fd      = _socket;
+    pfd.events  = POLLIN;
+    pfd.revents = 0;
+    // An error or hangup also means the next read returns at once, so treat it
+    // as readable rather than spinning the burst without ever draining.
+    return poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0;
+    #endif
+}
+
+// Apply one datagram read during recovery. Only a part of our session pushes
+// the deadline; junk and our own looped-back RESENDs don't, so recovery ends.
+void applyRecoveryPacket(const char* buf, int64_t length) {
+    Protocol::Header h;
+    if (Protocol::parseHeader(buf, static_cast<size_t>(length), h) == Protocol::Parse::BadVersion) {
+        warnVersionOnce(h.version);
+        return;
+    }
+    bool ours = false;
+    handleTransfer(buf, length, ours);
+    if (ours) refreshDeadline();
+}
+
+// Replies to apply between two RESEND requests: enough for a sender answering
+// at line rate, bounded so a junk flood cannot stall the burst.
+constexpr int RECOVERY_READS_PER_REQUEST = 64;
+
 /**
  * Runs when "FINISH" packet is received
  * Gets empty parts and requests them from the server
@@ -714,9 +761,13 @@ int checkParts() {
 
     size_t total = totalParts();
 
-    // Wall-clock deadline (refreshed only by a recovered part), so a junk flood
-    // that keeps recvfrom busy can't freeze recovery the way a per-round counter
-    // would. Recovery still gives up ttl_max seconds after the last real part.
+    SOCKADDR_IN sender_address;
+    memset(&sender_address, 0, sizeof(sender_address));
+    addr_len sender_address_length = sizeof(sender_address);
+
+    // Wall-clock deadline (refreshed only by a part from our sender), so a junk
+    // flood that keeps recvfrom busy can't freeze recovery the way a per-round
+    // counter would.
     refreshDeadline();
 
     while (!deadlineExpired() && parts.size() < total) {
@@ -737,6 +788,23 @@ int checkParts() {
                    sizeof(broadcast_address));
             if (verbose) std::cout << "Request part of file with index " << index << std::endl;
             if (pace_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
+
+            // Apply replies as they arrive. Sending the burst blind let a big
+            // missing set (missing x pace > ttl) expire the deadline before a
+            // single answer was read, with the sender having served them all.
+            for (int n = 0; n < RECOVERY_READS_PER_REQUEST && socketReadable(); ++n) {
+                auto got = recvfrom(_socket, buffer, static_cast<int>(bufcap), 0,
+                                    reinterpret_cast<sockaddr*>(&sender_address),
+                                    &sender_address_length);
+                if (got < 0) break;
+                if (got == 0) continue;
+                applyRecoveryPacket(buffer, static_cast<int64_t>(got));
+                if (storage_failed) {
+                    delete[] buffer;
+                    if (!resume) removePartFiles();
+                    return 2;
+                }
+            }
         }
 
         // Drain every packet already queued (until the socket times out via
@@ -744,11 +812,7 @@ int checkParts() {
         // packet per round made recovery O(N^2) in the number of missing parts:
         // one part recovered per round while re-requesting all of them, so N
         // losses took ~N^2 * delay to recover and buried the sender's replies.
-        SOCKADDR_IN sender_address;
-        memset(&sender_address, 0, sizeof(sender_address));
-        addr_len sender_address_length = sizeof(sender_address);
-
-        while (true) {
+        while (parts.size() < total) {
             // Bail on Ctrl+C or the deadline before each read, so a junk flood
             // that keeps recvfrom busy can't spin the drain loop forever.
             if (g_interrupted) return onInterrupt(buffer);
@@ -757,20 +821,9 @@ int checkParts() {
             auto length = recvfrom(_socket, buffer, static_cast<int>(bufcap), 0,
                                    reinterpret_cast<sockaddr*>(&sender_address),
                                    &sender_address_length);
-            if (length <= 0) break;  // queue drained this round
-            // A foreign protocol version deserves its one warning even when it
-            // first shows up during recovery; everything else that is not a
-            // TRANSFER for our session (e.g. our own looped-back RESENDs) is
-            // rejected by handleTransfer's own validation.
-            Protocol::Header h;
-            if (Protocol::parseHeader(buffer, static_cast<size_t>(length), h) ==
-                Protocol::Parse::BadVersion) {
-                warnVersionOnce(h.version);
-                continue;
-            }
-            // Only a recovered part pushes the deadline; junk and our own
-            // looped-back RESENDs don't, so recovery still terminates.
-            if (handleTransfer(buffer, static_cast<int64_t>(length))) refreshDeadline();
+            if (length < 0) break;      // idle tick: queue drained this round
+            if (length == 0) continue;  // an empty datagram is an event, not silence
+            applyRecoveryPacket(buffer, static_cast<int64_t>(length));
             if (storage_failed) {
                 delete[] buffer;
                 if (!resume) removePartFiles();
@@ -939,17 +992,26 @@ int dispatchPacket(char*& buf, size_t& bufcap, int64_t length, bool& finish) {
             if (!handleAnnounce(buf, bufcap, length, h.session, exit_code)) return exit_code;
             break;
         }
-        case Protocol::Type::Transfer:
+        case Protocol::Type::Transfer: {
             if (!have_session) warnUnannouncedDataOnce();
-            if (storage_ready && handleTransfer(buf, length)) refreshDeadline();
+            bool ours = false;
+            if (storage_ready) handleTransfer(buf, length, ours);
+            // A duplicate counts too (a resumed prefix, a repeat for another
+            // receiver): it still proves the sender is alive.
+            if (ours) refreshDeadline();
             if (storage_failed) return 2;
             break;
+        }
         case Protocol::Type::Finish:
             handleFinish(h.session, finish);
             break;
         default:
             break;  // other receivers' RESENDs, or an unknown type: ignore
     }
+
+    // Every part is in: finish now instead of waiting for a FINISH that may
+    // have been lost. checkParts finds nothing missing and verifies.
+    if (storage_ready && parts.size() == totalParts()) finish = true;
     return -1;
 }
 
