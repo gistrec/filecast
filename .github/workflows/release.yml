@@ -18,21 +18,26 @@ permissions:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
-    # Linux builds run inside debian:bullseye (glibc 2.31), so the binaries
-    # work on Ubuntu 20.04+/Debian 11+ regardless of which Ubuntu version the
-    # runner label points at; libstdc++/libgcc are linked statically for the
-    # same reason.
+    # Linux builds run inside Debian 11 (glibc 2.31), so the binaries work on
+    # Ubuntu 20.04+/Debian 11+ regardless of which Ubuntu version the runner
+    # label points at; libstdc++/libgcc are linked statically for the same
+    # reason. Debian 11 LTS ended 2026-08-31 and its security pool vanished
+    # from deb.debian.org, so a current debian:bullseye image (shipped with
+    # those security versions preinstalled) can no longer install a matching
+    # libc6-dev. Hence the image is pinned to the last build before the 11.11
+    # point release and apt is pointed at the permanent archive.debian.org
+    # mirror, which is exactly 11.11; only a build toolchain is installed.
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            container: debian:bullseye
+            container: debian:bullseye-20240812
             artifact_name: filecast
             asset_name: filecast-linux-x86_64
           - os: ubuntu-24.04-arm
-            container: debian:bullseye
+            container: debian:bullseye-20240812
             artifact_name: filecast
             asset_name: filecast-linux-arm64
           # One universal binary covers Apple Silicon and Intel Macs.
@@ -48,14 +53,10 @@ jobs:
         shell: ${{ matrix.os == 'windows-latest' && 'msys2 {0}' || 'bash' }}
 
     steps:
-      # Debian 11 LTS ended 2026-08-31: the bullseye-security pool is gone from
-      # deb.debian.org (every .deb 404s) while the main bullseye suite is still
-      # served. Only a build toolchain is installed here, so the point-release
-      # versions from main are fine; drop the dead suite before apt-get update.
       - name: Install build tools (Linux container)
         if: runner.os == 'Linux'
         run: |
-          sed -i '/bullseye-security/d' /etc/apt/sources.list
+          echo 'deb http://archive.debian.org/debian bullseye main' > /etc/apt/sources.list
           apt-get update
           apt-get install -y --no-install-recommends g++ cmake make git ca-certificates
 
