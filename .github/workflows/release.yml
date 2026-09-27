@@ -48,9 +48,14 @@ jobs:
         shell: ${{ matrix.os == 'windows-latest' && 'msys2 {0}' || 'bash' }}
 
     steps:
+      # Debian 11 LTS ended 2026-08-31: the bullseye-security pool is gone from
+      # deb.debian.org (every .deb 404s) while the main bullseye suite is still
+      # served. Only a build toolchain is installed here, so the point-release
+      # versions from main are fine; drop the dead suite before apt-get update.
       - name: Install build tools (Linux container)
         if: runner.os == 'Linux'
         run: |
+          sed -i '/bullseye-security/d' /etc/apt/sources.list
           apt-get update
           apt-get install -y --no-install-recommends g++ cmake make git ca-certificates
 
