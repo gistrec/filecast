@@ -88,7 +88,7 @@ void buildOptions(cxxopts::Options& options) {
         ("rate",      "Target send rate, Mbit/s",             cxxopts::value<int>()->default_value("100"))
         ("delay-ms",  "Override inter-packet pause, ms (advanced, overrides --rate)", cxxopts::value<int>())
         ("v,verbose", "Log every packet instead of a progress bar")
-        ("overwrite", "Overwrite an existing output file")
+        ("overwrite", "Overwrite an existing output file (and a stale .part in the way)")
         ("resume",    "Resume an interrupted transfer from its .part snapshot")
         ("h,help",    "Print help")
         ("version",   "Print version");

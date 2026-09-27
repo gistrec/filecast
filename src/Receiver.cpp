@@ -110,12 +110,34 @@ std::string part_path;
 bool storage_ready = false;
 bool storage_failed = false;
 
+// Which of <name>.part / <name>.part.idx this run created or adopted (matching
+// --resume snapshot, --overwrite takeover). Cleanup deletes only these: anything
+// else at those names is someone else's, and one ANNOUNCE must not destroy it.
+bool part_owned = false;
+bool idx_owned  = false;
+
 #if defined(_WIN32) || defined(_WIN64)
 HANDLE part_handle = INVALID_HANDLE_VALUE;
 #else
 int part_fd = -1;
 int durableSync(int fd);
 #endif
+
+// unlink/DeleteFile, unlike std::remove, refuse a directory planted at the name.
+void unlinkFile(const std::string& path) {
+    #if defined(_WIN32) || defined(_WIN64)
+    DeleteFileA(path.c_str());
+    #else
+    unlink(path.c_str());
+    #endif
+}
+
+// Outcome of opening the on-disk part file.
+enum class PartOpen {
+    Ok,      // open, sized, and owned by this run
+    Exists,  // something we did not create is already at that name; left untouched
+    Error,   // I/O or permission failure
+};
 
 // Received-parts registry: one bit per part instead of an std::set<size_t>. A
 // set cost ~48 bytes per stored part, so a 4 GiB file at a 64-byte chunk (67M
@@ -188,65 +210,112 @@ bool isLoneRegularFile(int fd) {
 }
 #endif
 
-bool openPartFile(bool reuse_existing) {
+// Open <name>.part. reuse_existing adopts a matching --resume snapshot (exactly
+// file_length bytes); otherwise the file is created exclusively and an existing
+// one is only replaced under --overwrite. Exists = leave it alone.
+PartOpen openPartFile(bool reuse_existing) {
     closePartFile(false);
     part_path = snapshotPartPath();
     storage_ready = false;
     storage_failed = false;
+    bool replacing = false;  // an existing file the user let us take over
 
     #if defined(_WIN32) || defined(_WIN64)
-    // OPEN_ALWAYS avoids truncating and FILE_FLAG_OPEN_REPARSE_POINT opens the
-    // link itself, so isLoneRegularFile can refuse it before any write.
-    DWORD disposition = reuse_existing ? OPEN_EXISTING : OPEN_ALWAYS;
+    // FILE_FLAG_OPEN_REPARSE_POINT opens a link itself so isLoneRegularFile can
+    // refuse it; CREATE_NEW fails on anything already there.
+    DWORD disposition = reuse_existing ? OPEN_EXISTING : CREATE_NEW;
     part_handle = CreateFileA(part_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                               disposition, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (part_handle == INVALID_HANDLE_VALUE) return false;
+    if (part_handle == INVALID_HANDLE_VALUE && !reuse_existing) {
+        DWORD err = GetLastError();
+        if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) return PartOpen::Error;
+        if (!overwrite) return PartOpen::Exists;
+        replacing = true;
+        part_handle = CreateFileA(part_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                  OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    }
+    if (part_handle == INVALID_HANDLE_VALUE) return PartOpen::Error;
 
     if (!isLoneRegularFile(part_handle)) {
         closePartFile(false);
-        return false;
+        return PartOpen::Error;
     }
+
+    // Anything we created here must not outlive a failure to size it: the next
+    // run would refuse its own leftover as a foreign file.
+    const bool created = !reuse_existing && !replacing;
+    auto fail = [&]() {
+        closePartFile(false);
+        if (created) unlinkFile(part_path);
+        return PartOpen::Error;
+    };
 
     LARGE_INTEGER pos;
     if (reuse_existing) {
         if (!GetFileSizeEx(part_handle, &pos) ||
             static_cast<uint64_t>(pos.QuadPart) != static_cast<uint64_t>(file_length)) {
-            closePartFile(false);
-            return false;
+            return fail();
         }
     } else {
+        pos.QuadPart = 0;  // drop first: a replaced file keeps none of its bytes
+        if (replacing && (!SetFilePointerEx(part_handle, pos, nullptr, FILE_BEGIN) ||
+                          !SetEndOfFile(part_handle))) {
+            return fail();
+        }
         pos.QuadPart = static_cast<LONGLONG>(file_length);
         if (!SetFilePointerEx(part_handle, pos, nullptr, FILE_BEGIN) ||
             !SetEndOfFile(part_handle)) {
-            closePartFile(false);
-            return false;
+            return fail();
         }
     }
     #else
-    // No O_TRUNC: it would wipe a pre-planted hardlink's victim before the
-    // isLoneRegularFile guard below could refuse it.
-    part_fd = open(part_path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
-    if (part_fd < 0) return false;
+    // O_EXCL refuses anything already there instead of truncating through it;
+    // the --overwrite reopen skips O_TRUNC so the hardlink guard still runs first.
+    int flags = reuse_existing ? O_RDWR : (O_RDWR | O_CREAT | O_EXCL);
+    part_fd = open(part_path.c_str(), flags | O_NOFOLLOW, 0644);
+    if (part_fd < 0 && !reuse_existing) {
+        if (errno != EEXIST) return PartOpen::Error;
+        if (!overwrite) return PartOpen::Exists;
+        replacing = true;
+        part_fd = open(part_path.c_str(), O_RDWR | O_NOFOLLOW);
+    }
+    if (part_fd < 0) return PartOpen::Error;
+
+    // Anything we created here must not outlive a failure to size it: the next
+    // run would refuse its own leftover as a foreign file.
+    const bool created = !reuse_existing && !replacing;
+    auto fail = [&]() {
+        closePartFile(false);
+        if (created) unlinkFile(part_path);
+        return PartOpen::Error;
+    };
 
     if (!isLoneRegularFile(part_fd)) {
+        // Not ours to delete even if the create looked exclusive: a hardlink
+        // shares the inode, and unlinking the name is the caller's job anyway.
         closePartFile(false);
-        return false;
+        return PartOpen::Error;
     }
     if (reuse_existing) {
         struct stat st;
         if (fstat(part_fd, &st) != 0 || st.st_size < 0 ||
             static_cast<size_t>(st.st_size) != file_length) {
-            closePartFile(false);
-            return false;
+            return fail();
         }
-    } else if (ftruncate(part_fd, static_cast<off_t>(file_length)) != 0) {
-        closePartFile(false);
-        return false;
+    } else if ((replacing && ftruncate(part_fd, 0) != 0) ||
+               ftruncate(part_fd, static_cast<off_t>(file_length)) != 0) {
+        return fail();
     }
     #endif
 
+    // A replaced .part makes the snapshot beside it describe bytes that are gone.
+    if (replacing) {
+        unlinkFile(fileName + ".part.idx");
+        idx_owned = false;
+    }
+    part_owned = true;
     storage_ready = true;
-    return true;
+    return PartOpen::Ok;
 }
 
 bool writePartAt(size_t offset, const char* data, size_t len) {
@@ -291,14 +360,17 @@ bool hashPartFile(uint8_t out[32]) {
     return Sha256::hashStream(in, file_length, out);
 }
 
+// Discard the in-progress file and its snapshot, but only the ones this run owns.
 void removePartFiles() {
-    // part_path is set as soon as openPartFile() runs, which only happens while
-    // handling an ANNOUNCE. Empty means no part file opened this run — fileName
-    // is still "", so removing fileName+".part" would nuke a bare ".part" in cwd.
-    if (part_path.empty()) return;
     closePartFile(false);
-    std::remove(snapshotPartPath().c_str());
-    std::remove((fileName + ".part.idx").c_str());
+    if (part_owned) {
+        unlinkFile(snapshotPartPath());
+        part_owned = false;
+    }
+    if (idx_owned) {
+        unlinkFile(fileName + ".part.idx");
+        idx_owned = false;
+    }
     storage_ready = false;
 }
 
@@ -441,7 +513,7 @@ int finalizeVerifiedPart(const std::string& target) {
     if (overwrite) {
         if (finalizeReplace(part_path, target)) {
             storage_ready = false;
-            return 0;
+            return 0;  // ownership stands: discardSnapshot clears a leftover .part
         }
         std::cerr << "Error: Failed to finalize " << target
                   << "; verified data kept at " << part_path << std::endl;
@@ -553,13 +625,15 @@ bool saveSnapshot() {
     Utils::writeBytesFromNumber(idx.data() + 47, chunk_size,  4);
     // The registry bitmap already has the on-disk layout, so copy it wholesale.
     memcpy(idx.data() + SNAPSHOT_HEADER, parts.bits.data(), bmSize);
+    // Owned from here on: the write truncates whatever is at that path, so a
+    // half-written index has to be ours to clean up.
+    idx_owned = true;
     return writeRawFile(fileName + ".part.idx", idx.data(), idx.size());
 }
 
-// Remove the snapshot once the transfer has completed and been written out.
+// Remove the snapshot once the transfer completed (same ownership rule).
 void discardSnapshot() {
-    std::remove((fileName + ".part").c_str());
-    std::remove((fileName + ".part.idx").c_str());
+    removePartFiles();
 }
 
 // Try to load a matching snapshot into the part file and part registry. Only
@@ -581,7 +655,8 @@ bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
     if (Utils::getNumberFromBytes(idx.data() + 47, 4) != chunk) return false;
     const char* bm = idx.data() + SNAPSHOT_HEADER;
 
-    if (!openPartFile(true)) return false;
+    if (openPartFile(true) != PartOpen::Ok) return false;
+    idx_owned = true;  // the snapshot is ours to discard once the file completes
 
     parts.reset(total);
     received_bytes = 0;
@@ -592,6 +667,14 @@ bool tryResume(size_t announced, size_t chunk, const uint8_t hash[32]) {
         }
     }
     return true;
+}
+
+// A payload write failed (a full disk). With --resume, keep what did land and
+// index it so the next run adopts it; with nothing stored there is nothing to
+// resume, so drop our own .part rather than leave a file that run must refuse.
+void keepAfterWriteFailure() {
+    if (resume && parts.size() > 0 && saveSnapshot()) return;
+    removePartFiles();
 }
 
 // Snapshot the partial file and clean up after Ctrl+C/SIGTERM. Returns 130.
@@ -773,7 +856,7 @@ int checkParts() {
             if (handleTransfer(buffer, static_cast<int64_t>(length))) refreshDeadline();
             if (storage_failed) {
                 delete[] buffer;
-                if (!resume) removePartFiles();
+                keepAfterWriteFailure();
                 return 2;
             }
         }
@@ -807,27 +890,71 @@ bool growRecvBuffer(char*& buf, size_t& bufcap, int& exit_code) {
     return true;
 }
 
+// Outcome of setting up on-disk storage for a freshly announced transfer.
+enum class Storage {
+    Ready,    // .part open: fresh, or resumed from a matching snapshot
+    Refused,  // a file we did not create sits at <name>.part; ignore the announcement
+    Failed,   // I/O error; exit_code is set
+};
+
+// Once per path: the user needs to know why the receiver keeps waiting.
+void warnPartExists(const std::string& path) {
+    static std::string last;
+    if (path == last) return;
+    last = path;
+    std::cerr << "Warning: " << path << " already exists and is not from this transfer; "
+                 "ignoring the announcement (delete it, or pass --overwrite to replace it)"
+              << std::endl;
+}
+
 // Create a fresh on-disk part file for a new transfer.
-bool createPartFresh(int& exit_code) {
+Storage createPartFresh(int& exit_code) {
     closePartFile(false);
     parts.reset(totalParts());
     received_bytes = 0;
-    if (!openPartFile(false)) {
-        std::cerr << "Error: Can't create temporary output file " << snapshotPartPath() << std::endl;
-        exit_code = 1;
-        return false;
+    // An index we neither wrote nor adopted belongs to someone else, and a
+    // snapshot later in this run would truncate it. Refuse the same way an
+    // existing .part does, so the guarantee holds for both names.
+    const std::string idx_path = fileName + ".part.idx";
+    if (!idx_owned && fileExists(idx_path)) {
+        if (!overwrite) {
+            warnPartExists(idx_path);
+            return Storage::Refused;
+        }
+        unlinkFile(idx_path);
     }
-    return true;
+    switch (openPartFile(false)) {
+        case PartOpen::Ok:
+            return Storage::Ready;
+        case PartOpen::Exists:
+            warnPartExists(snapshotPartPath());
+            return Storage::Refused;
+        case PartOpen::Error:
+        default:
+            std::cerr << "Error: Can't create temporary output file " << snapshotPartPath() << std::endl;
+            exit_code = 1;
+            return Storage::Failed;
+    }
 }
 
 // Grow the receive buffer and set up the file buffer: resume from a matching
 // snapshot when --resume is given, otherwise start fresh. Sets resumed.
-bool prepareStorage(char*& buf, size_t& bufcap, size_t announced, size_t chunk,
-                    bool& resumed, int& exit_code) {
-    if (!growRecvBuffer(buf, bufcap, exit_code)) return false;
+Storage prepareStorage(char*& buf, size_t& bufcap, size_t announced, size_t chunk,
+                       bool& resumed, int& exit_code) {
+    if (!growRecvBuffer(buf, bufcap, exit_code)) return Storage::Failed;
     resumed = resume && tryResume(announced, chunk, expected_hash);
-    if (!resumed && !createPartFresh(exit_code)) return false;
-    return true;
+    if (resumed) return Storage::Ready;
+    return createPartFresh(exit_code);
+}
+
+// Forget a session whose storage could not be set up: wait on as if the
+// announcement had never arrived.
+void unlatch() {
+    have_session  = false;
+    session_id    = 0;
+    storage_ready = false;
+    part_path.clear();
+    if (!fileNameFromCli) fileName.clear();
 }
 
 // Parse and latch an ANNOUNCE (the session id comes pre-parsed from the common
@@ -875,10 +1002,6 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
         return true;
     }
 
-    // Only a valid packet from our sender pushes the timeout out, so a noisy or
-    // hostile host cannot keep the receiver alive forever.
-    refreshDeadline();
-
     session_id   = incoming_sid;
     have_session = true;
     file_length  = announced;
@@ -888,7 +1011,22 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
     if (!fileNameFromCli) fileName = announced_name;
 
     bool resumed = false;
-    if (!prepareStorage(buf, bufcap, announced, incoming_cs, resumed, exit_code)) return false;
+    switch (prepareStorage(buf, bufcap, announced, incoming_cs, resumed, exit_code)) {
+        case Storage::Ready:
+            break;
+        case Storage::Refused:
+            // A file we did not create sits at one of our names: leave it and
+            // forget this announcement (deadline included). createPartFresh
+            // has already named the file in a warning.
+            unlatch();
+            return true;
+        case Storage::Failed:
+        default:
+            return false;
+    }
+
+    // Only a valid, usable announcement pushes the timeout out.
+    refreshDeadline();
 
     if (verbose) {
         std::cout << "Receive information about new file: " << fileName
@@ -1004,7 +1142,7 @@ int run() {
         int code = dispatchPacket(buffer, bufcap, static_cast<int64_t>(length), finish);
         if (code >= 0) {
             delete[] buffer;
-            if (code != 0 && !resume) removePartFiles();
+            if (code != 0) keepAfterWriteFailure();
             return code;
         }
     }

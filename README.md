@@ -161,7 +161,7 @@ filecast receive [file] [options]    # receive a file (default: name from sender
 | `--mtu`       | `1500`     | 64..65489 | Max packet size in bytes (18-byte header keeps the datagram within the 65507-byte UDP limit) |
 | `--ttl`       | `15`       | 1..86400 | Seconds of silence before giving up |
 | `--rate`      | `100`      | > 0 | Target send rate in Mbit/s |
-| `--overwrite` | off        | — | Overwrite an existing output file |
+| `--overwrite` | off        | — | Overwrite an existing output file (and a stale `.part` in the way) |
 | `--resume`    | off        | — | Resume an interrupted receive from its `.part` snapshot |
 | `-v, --verbose` | off      | — | Log every packet instead of a progress bar |
 | `--delay-ms`  | —          | ≥ 0 | Advanced: fixed inter-packet pause in ms; overrides `--rate` (`0` blasts at full speed, used by tests) |
@@ -266,6 +266,11 @@ too, not just the retry: a plain `filecast receive` deletes its partial file whe
 it is interrupted. The snapshot is removed once the file completes and its
 checksum verifies.
 
+A `<name>.part` that does not belong to the announced transfer (a snapshot of a
+different file, a leftover from another tool) is never touched: the receiver
+warns, ignores that announcement and keeps waiting. Delete the file, or pass
+`--overwrite` to let the receiver replace it.
+
 ## Limitations
 
 - The v3 wire format stores the file size and part index in 4-byte fields. The
@@ -281,8 +286,10 @@ checksum verifies.
   (SIGKILL) or power loss mid-transfer can still lose the latest unflushed
   progress. The `.part`/`.part.idx` files use stable, predictable names in the
   working directory. The receiver refuses to write through a symlink or a
-  pre-planted hardlink at those names, but still run it from a directory only
-  you can write to.
+  pre-planted hardlink at those names, and it never truncates or deletes a
+  `.part`/`.part.idx` it did not create itself (so an unauthenticated
+  announcement cannot destroy a real snapshot), but still run it from a
+  directory only you can write to.
 - No authentication. Any host on the same LAN can announce a transfer and any
   receiver bound to the chosen port will accept it. The SHA-256 check catches
   accidental corruption, not a deliberately crafted stream.

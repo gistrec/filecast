@@ -8,9 +8,9 @@
 #
 #   * exit 2 and report "Failed to write received data",
 #   * NOT produce the output file, and
-#   * clean up according to mode — a plain receive drops the .part storage
-#     entirely (removePartFiles), while a --resume receive keeps the .part so a
-#     later run can retry, but never leaves a half-written .part.idx snapshot.
+#   * clean up in both modes: nothing was stored, so there is nothing to resume
+#     from and neither the .part nor a half-written .part.idx may be left
+#     behind — a leftover .part is a file the next run has to refuse.
 #
 # The shim only intercepts pwrite(), which on POSIX is writePartAt()'s sole
 # syscall, so the open()/ftruncate() that create the .part file still succeed and
@@ -131,31 +131,68 @@ run_diskfull_test() {
         ls "$dir"
         return 1
     fi
-    # Mode-specific .part handling: plain receive wipes it (removePartFiles);
-    # --resume keeps the (sparse, unwritten) .part so a later retry can reuse it
-    # instead of reallocating from scratch.
-    if [ -n "$extra_flag" ]; then
-        if [ ! -f "$dir/out.bin.part" ]; then
-            echo "FAIL: [$label] --resume should keep the .part for a later retry"
-            ls "$dir"
-            return 1
-        fi
-    else
-        if [ -f "$dir/out.bin.part" ]; then
-            echo "FAIL: [$label] plain receive left a .part behind:"
-            ls "$dir"
-            return 1
-        fi
+    # Not a byte was stored, so both modes drop the .part: keeping the sparse
+    # file only saved a reallocation, and the next run would have to refuse it
+    # as a file it did not create.
+    if [ -f "$dir/out.bin.part" ]; then
+        echo "FAIL: [$label] left a .part behind with nothing stored:"
+        ls "$dir"
+        return 1
     fi
 
     echo "PASS: [$label] write failure rejected (exit 2, no output, correct cleanup)"
 }
 
-# Plain receive: write failure -> removePartFiles() wipes the .part storage.
+# A retry after the failure must actually run: whatever the first attempt left
+# behind, the second one has to be able to create its own .part.
+run_retry_after_diskfull() {
+    local dir="$WORKDIR/diskfull-retry"
+    mkdir -p "$dir"
+    local src="$dir/src.bin"
+    dd if=/dev/urandom of="$src" bs=1024 count=20 status=none
+
+    echo "==> [retry] first attempt with the pwrite->ENOSPC shim"
+    env "$PRELOAD_VAR=$FAILLIB" ASAN_OPTIONS="$RECV_ASAN_OPTIONS" FAILPWRITE_AFTER=0 \
+        "$BINARY" receive "$dir/out.bin" --to 127.0.0.1 \
+                  --bind-port "$RECV_BIND" --port "$SEND_BIND" \
+                  --ttl 5 --delay-ms 0 --resume > "$dir/recv1.log" 2>&1 &
+    RECV_PID=$!
+    sleep 1
+    "$BINARY" send "$src" --to 127.0.0.1 --bind-port "$SEND_BIND" --port "$RECV_BIND" \
+              --ttl 5 --delay-ms 0 > "$dir/send1.log" 2>&1 &
+    SEND_PID=$!
+    wait "$RECV_PID" 2>/dev/null || true; RECV_PID=""
+    kill "$SEND_PID" 2>/dev/null || true; wait "$SEND_PID" 2>/dev/null || true; SEND_PID=""
+
+    echo "==> [retry] second attempt, no shim"
+    "$BINARY" receive "$dir/out.bin" --to 127.0.0.1 \
+              --bind-port "$RECV_BIND" --port "$SEND_BIND" \
+              --ttl 5 --delay-ms 0 --resume > "$dir/recv2.log" 2>&1 &
+    RECV_PID=$!
+    sleep 1
+    "$BINARY" send "$src" --to 127.0.0.1 --bind-port "$SEND_BIND" --port "$RECV_BIND" \
+              --ttl 5 --delay-ms 0 > "$dir/send2.log" 2>&1 &
+    SEND_PID=$!
+    local rc=0
+    wait "$RECV_PID" || rc=$?; RECV_PID=""
+    kill "$SEND_PID" 2>/dev/null || true; wait "$SEND_PID" 2>/dev/null || true; SEND_PID=""
+
+    if [ "$rc" -ne 0 ]; then
+        echo "FAIL: [retry] retry after a write failure did not complete (exit $rc)"
+        tail -5 "$dir/recv2.log"
+        return 1
+    fi
+    if ! cmp -s "$src" "$dir/out.bin"; then
+        echo "FAIL: [retry] retried transfer does not match the source"
+        return 1
+    fi
+    echo "PASS: [retry] transfer completes on the run after a write failure"
+}
+
+# Both modes: a write failure before any part landed leaves nothing behind.
 run_diskfull_test "diskfull-plain"  ""
-# Resumable receive: write failure keeps the .part (retryable) but writes no
-# .part.idx snapshot for a transfer that never stored a byte.
 run_diskfull_test "diskfull-resume" "--resume"
+run_retry_after_diskfull
 
 echo
 echo "All disk-full E2E tests passed."
