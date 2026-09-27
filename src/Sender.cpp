@@ -111,6 +111,15 @@ bool sendPart(size_t part_index, bool* delivered = nullptr, int* send_errno = nu
     return true;
 }
 
+// Send/receive buffer size. A TRANSFER datagram (header + mtu) has to fit, and
+// so does the ANNOUNCE: the socket hears our own broadcasts back, and on Winsock
+// a datagram larger than the buffer fails the read (WSAEMSGSIZE), which
+// serveResends counts as an idle second and drains ttl.
+size_t bufferSize() {
+    return std::max(static_cast<size_t>(2 * mtu),
+                    Protocol::ANNOUNCE_FIXED + Protocol::MAX_NAME_LEN);
+}
+
 // Pause between packets to pace the transfer (0 = blast at full speed).
 void pace() {
     if (pace_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
@@ -179,14 +188,11 @@ bool sendAnnounce() {
     if (!hashInputFile(file_hash)) return false;
     if (verbose) std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
 
-    // Name the receiver saves under unless it was given an explicit output path.
-    // Clamp so the whole ANNOUNCE fits the send buffer (2 * mtu), the length
-    // field (a byte count well under 2^16), and the receiver's on-disk name cap
-    // (Protocol::MAX_NAME_LEN, which leaves room for the ".part.idx" suffix).
+    // Name the receiver saves under unless given an explicit output path,
+    // clamped to the receiver's on-disk cap. The ANNOUNCE has its own buffer,
+    // so --mtu does not bound it (a small --mtu used to truncate the name).
     std::string name = baseName(fileName);
-    size_t max_name = static_cast<size_t>(2 * mtu) - Protocol::ANNOUNCE_FIXED;
-    if (max_name > Protocol::MAX_NAME_LEN) max_name = Protocol::MAX_NAME_LEN;
-    if (name.size() > max_name) name.resize(max_name);
+    if (name.size() > Protocol::MAX_NAME_LEN) name.resize(Protocol::MAX_NAME_LEN);
 
     announce_packet.assign(Protocol::ANNOUNCE_FIXED + name.size(), 0);
     char* pkt = announce_packet.data();
@@ -260,12 +266,11 @@ bool serveResends(size_t total_parts, size_t& resent) {
     addr_len sender_address_length = sizeof(sender_address);
 
     while (ttl && std::chrono::steady_clock::now() < phase_deadline) {
-        // Read into the full buffer (2 * mtu). The socket is bound to the same
-        // port we broadcast to, so the OS also delivers copies of our own
-        // TRANSFER packets here; on Windows a 100-byte buffer made those
-        // oversized datagrams fail with WSAEMSGSIZE, which was misread as a
-        // timeout and prematurely drained ttl, killing the resend phase.
-        auto result = recvfrom(_socket, buffer, 2 * mtu, 0,
+        // Read into the full buffer. The socket is bound to the same port we
+        // broadcast to, so the OS also delivers copies of our own TRANSFER and
+        // ANNOUNCE packets here; on Windows a datagram larger than the buffer
+        // fails with WSAEMSGSIZE, which is misread as a timeout and drains ttl.
+        auto result = recvfrom(_socket, buffer, static_cast<int>(bufferSize()), 0,
                                reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
         // Timeout (< 0): no requests this round, so re-announce FINISH and count ttl
@@ -366,7 +371,7 @@ int run() {
         return 1;
     }
 
-    buffer = new char[2 * mtu];
+    buffer = new char[bufferSize()];
 
     if (openInputFile() != 0) {
         delete[] buffer;
@@ -394,19 +399,23 @@ int run() {
     size_t delivered_parts = 0;
     int send_errno = 0;
 
-    // Repeat the ANNOUNCE across the first second of DATA, so one lost initial
-    // burst no longer strands every receiver.
+    // Repeat the ANNOUNCE densely across the first second, then once a second
+    // until FINISH, so a receiver starting mid-stream still latches and
+    // recovers via RESEND instead of timing out on un-announced data.
     constexpr std::chrono::milliseconds announce_repeat_at[] = {200ms, 500ms, 1000ms};
     constexpr size_t announce_repeats = sizeof(announce_repeat_at) / sizeof(announce_repeat_at[0]);
+    constexpr std::chrono::milliseconds announce_period = 1000ms;
     size_t announces_repeated = 0;
     const auto stream_start = std::chrono::steady_clock::now();
+    auto next_announce = stream_start + announce_repeat_at[0];
 
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
-        if (announces_repeated < announce_repeats &&
-            std::chrono::steady_clock::now() - stream_start >=
-                announce_repeat_at[announces_repeated]) {
+        if (std::chrono::steady_clock::now() >= next_announce) {
             resendAnnounce();
             ++announces_repeated;
+            next_announce = (announces_repeated < announce_repeats)
+                          ? stream_start + announce_repeat_at[announces_repeated]
+                          : next_announce + announce_period;
         }
         bool delivered = false;
         if (!sendPart(part_index, &delivered, &send_errno)) {
