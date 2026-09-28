@@ -86,6 +86,36 @@ void warnVersionOnce(uint8_t seen) {
               << static_cast<int>(Protocol::VERSION) << ")" << std::endl;
 }
 
+// A warning any LAN host can trigger per packet. One unbuffered stderr line
+// each buries the console and blocks the receive loop, so print at most one
+// per window and fold the swallowed ones into the next line.
+constexpr std::chrono::seconds WARN_THROTTLE_WINDOW{1};
+
+struct ThrottledWarning {
+    const char* text;
+    std::chrono::steady_clock::time_point last{};
+    bool   printed    = false;
+    size_t suppressed = 0;
+
+    void fire() {
+        auto now = std::chrono::steady_clock::now();
+        if (printed && now - last < WARN_THROTTLE_WINDOW) {
+            ++suppressed;
+            return;
+        }
+        last    = now;
+        printed = true;
+        std::cerr << "Warning: " << text;
+        if (suppressed > 0) std::cerr << " (" << suppressed << " more suppressed)";
+        std::cerr << std::endl;
+        suppressed = 0;
+    }
+};
+
+ThrottledWarning warn_foreign_session{"ignoring announcement from another sender session"};
+ThrottledWarning warn_conflicting_announce{"ignoring conflicting announcement for the active session"};
+ThrottledWarning warn_invalid_announce{"ignoring announcement with invalid file/chunk size"};
+
 // Once per run: without it a lost ANNOUNCE burst looks exactly like no sender
 // at all while every DATA packet is silently discarded.
 void warnUnannouncedDataOnce() {
@@ -841,7 +871,7 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
     // An ANNOUNCE from a different session (a second sender, or our own sender
     // restarted) must not clobber the transfer already in progress.
     if (have_session && incoming_sid != session_id) {
-        std::cerr << "Warning: ignoring announcement from another sender session" << std::endl;
+        warn_foreign_session.fire();
         return true;
     }
 
@@ -858,8 +888,7 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
         bool same = announced == file_length && incoming_cs == chunk_size &&
                     memcmp(expected_hash, buf + Protocol::HEADER_SIZE + 8, 32) == 0;
         if (!same) {
-            std::cerr << "Warning: ignoring conflicting announcement for the active session"
-                      << std::endl;
+            warn_conflicting_announce.fire();
             return true;
         }
         refreshDeadline();
@@ -870,8 +899,7 @@ bool handleAnnounce(char*& buf, size_t& bufcap, int64_t length, uint32_t incomin
     // ANNOUNCE (empty file, out-of-range chunk) must be ignored like any junk, not
     // exit the receiver or hold it alive. Mirrors the same-session guard above.
     if (!Protocol::announceInRange(announced, incoming_cs, MAX_FILE_LENGTH)) {
-        std::cerr << "Warning: ignoring announcement with invalid file/chunk size"
-                  << std::endl;
+        warn_invalid_announce.fire();
         return true;
     }
 

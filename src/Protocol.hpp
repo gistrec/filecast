@@ -171,6 +171,33 @@ inline bool hasControlChar(const std::string& name) {
     });
 }
 
+// Is the name well-formed UTF-8? A filesystem that stores names as Unicode
+// refuses an invalid sequence (macOS open() fails with EILSEQ), so one such
+// ANNOUNCE stopped a waiting receiver from creating its .part file at all.
+// Checked strictly per RFC 3629: the overlong forms, surrogate halves and
+// values above U+10FFFF are exactly what those filesystems reject.
+inline bool isValidUtf8(const std::string& name) {
+    const size_t n = name.size();
+    auto at = [&](size_t k) { return static_cast<unsigned char>(name[k]); };
+    for (size_t i = 0; i < n; ) {
+        unsigned char c = at(i), lo = 0x80, hi = 0xBF;
+        size_t len;
+        // The second byte narrows for the leads that would otherwise admit an
+        // overlong form (E0, F0), a surrogate (ED) or > U+10FFFF (F4).
+        if (c < 0x80)                  { ++i; continue; }
+        else if (c >= 0xC2 && c <= 0xDF) len = 2;
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; if (c == 0xE0) lo = 0xA0; if (c == 0xED) hi = 0x9F; }
+        else if (c >= 0xF0 && c <= 0xF4) { len = 4; if (c == 0xF0) lo = 0x90; if (c == 0xF4) hi = 0x8F; }
+        else return false;  // continuation byte out of place, C0/C1, or F5..FF
+        if (i + len > n || at(i + 1) < lo || at(i + 1) > hi) return false;
+        for (size_t k = 2; k < len; ++k) {
+            if (at(i + k) < 0x80 || at(i + k) > 0xBF) return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
 // Longest base name the receiver will materialize on disk. It appends the
 // ".part.idx" suffix (9 bytes) to build the resume-snapshot path, and most
 // filesystems cap a single path component at NAME_MAX (255). Keeping the base
@@ -180,18 +207,32 @@ inline bool hasControlChar(const std::string& name) {
 // over-long ANNOUNCE aimed at a still-waiting receiver.
 constexpr size_t MAX_NAME_LEN = 255 - 9;  // room for the ".part.idx" suffix
 
+// Shorten `name` to at most `max` bytes without splitting a character: cutting
+// mid-sequence would produce exactly the invalid encoding isValidUtf8 rejects,
+// so both ends of the wire clamp through here.
+inline std::string clampUtf8(std::string name, size_t max) {
+    if (name.size() <= max) return name;
+    size_t cut = max;
+    while (cut > 0 && (static_cast<unsigned char>(name[cut]) & 0xC0) == 0x80) --cut;
+    name.resize(cut);
+    return name;
+}
+
 // Reduce a sender-supplied name to a safe base name in the working directory:
 // strip directories, reject traversal, ':' (Windows drive-relative / ADS),
-// control/NUL bytes and reserved device names by falling back to "file.out",
-// then clamp the length so the ".part"/".part.idx" paths fit NAME_MAX.
+// control/NUL bytes, invalid UTF-8 and reserved device names by falling back to
+// "file.out", then clamp the length so the ".part"/".part.idx" paths fit
+// NAME_MAX.
 inline std::string sanitizeName(const std::string& raw) {
     size_t slash = raw.find_last_of("/\\");
     std::string name = (slash == std::string::npos) ? raw : raw.substr(slash + 1);
     if (name.empty() || name == "." || name == "..") return "file.out";
     if (name.find(':') != std::string::npos) return "file.out";
     if (hasControlChar(name)) return "file.out";
+    if (!isValidUtf8(name)) return "file.out";
     if (isReservedDeviceName(name)) return "file.out";
-    if (name.size() > MAX_NAME_LEN) name.resize(MAX_NAME_LEN);
+    name = clampUtf8(name, MAX_NAME_LEN);
+    if (name.empty()) return "file.out";
     return name;
 }
 
