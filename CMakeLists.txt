@@ -200,8 +200,19 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # Forged ANNOUNCEs must not touch a .part/.part.idx we did not
+            # create (stray file, directory, real --resume snapshot).
+            add_test(
+                NAME e2e_partguard
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_partguard.sh
+            )
+            set_tests_properties(e2e_partguard PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
-            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack, e2e_flood, e2e_prelatch and e2e_lostannounce tests")
+            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack, e2e_flood, e2e_prelatch, e2e_lostannounce and e2e_partguard tests")
         endif()
     endif()
 endif()
