@@ -23,9 +23,39 @@
 #endif
 
 #include <cstddef>
+#include <cerrno>
 
 
 namespace Utils {
+    /** Error code of the recvfrom() that just failed (Winsock: not errno). */
+    inline int lastRecvErrorCode() {
+#if defined(_WIN32) || defined(_WIN64)
+        return WSAGetLastError();
+#else
+        return errno;
+#endif
+    }
+
+    /**
+     * Did a failed recvfrom() report a per-datagram event rather than silence?
+     * These return immediately, so counting them as idle seconds drains a
+     * timeout budget in microseconds (on Winsock an oversized datagram fails
+     * the read, and an ICMP reject surfaces on the next one). Unknown codes
+     * return false and take the idle path, so a broken socket cannot spin.
+     */
+    inline bool isDatagramRecvError(int code) {
+        // Everything else, WSAETIMEDOUT and EAGAIN included, takes the idle path.
+#if defined(_WIN32) || defined(_WIN64)
+        return code == WSAEINTR || code == WSAEMSGSIZE || code == WSAECONNRESET ||
+               code == WSAENETRESET || code == WSAECONNREFUSED ||
+               code == WSAEHOSTUNREACH || code == WSAENETUNREACH;
+#else
+        return code == EINTR || code == EMSGSIZE || code == ECONNRESET ||
+               code == ENETRESET || code == ECONNREFUSED ||
+               code == EHOSTUNREACH || code == ENETUNREACH;
+#endif
+    }
+
     /**
      * Decode an unsigned integer from a big-endian byte sequence.
      */

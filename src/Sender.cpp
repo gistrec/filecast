@@ -192,7 +192,7 @@ bool sendAnnounce() {
     // clamped to the receiver's on-disk cap. The ANNOUNCE has its own buffer,
     // so --mtu does not bound it (a small --mtu used to truncate the name).
     std::string name = baseName(fileName);
-    if (name.size() > Protocol::MAX_NAME_LEN) name.resize(Protocol::MAX_NAME_LEN);
+    name = Protocol::clampUtf8(name, Protocol::MAX_NAME_LEN);
 
     announce_packet.assign(Protocol::ANNOUNCE_FIXED + name.size(), 0);
     char* pkt = announce_packet.data();
@@ -240,6 +240,18 @@ void resendAnnounce() {
     }
 }
 
+// The rate limit below looks one second back, so older records are dead
+// weight; evicting them keeps the map sized by the re-send rate rather than by
+// every distinct part the phase ever served (hundreds of MB on a large file).
+constexpr int64_t SENT_PART_RETAIN_SECONDS = 2;
+
+void evictStaleResendRecords(int64_t now) {
+    for (auto it = sent_part.begin(); it != sent_part.end(); ) {
+        if (now - it->second >= SENT_PART_RETAIN_SECONDS) it = sent_part.erase(it);
+        else ++it;
+    }
+}
+
 // Absolute ceiling on the whole resend-serving phase, expressed as a multiple of
 // ttl_max. The idle ttl already ends the phase once RESEND requests stop; this is
 // a backstop for a peer (buggy or hostile) that keeps sending valid RESENDs, each
@@ -273,10 +285,12 @@ bool serveResends(size_t total_parts, size_t& resent) {
         auto result = recvfrom(_socket, buffer, static_cast<int>(bufferSize()), 0,
                                reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
-        // Timeout (< 0): no requests this round, so re-announce FINISH and count ttl
-        // down. A zero-length datagram is a real event, not silence: ignore it so
-        // empty packets can't drain the resend phase early.
+        // Idle timeout: no requests this round, so re-announce FINISH and count
+        // ttl down. A zero-length datagram, or a read that failed because of the
+        // datagram rather than the wait (Winsock WSAEMSGSIZE/WSAECONNRESET),
+        // is an event, not silence — counting it drained ttl in milliseconds.
         if (result < 0) {
+            if (Utils::isDatagramRecvError(Utils::lastRecvErrorCode())) continue;
             ttl--;
             resendAnnounce();
             sendFinish();
@@ -332,9 +346,10 @@ bool serveResends(size_t total_parts, size_t& resent) {
             // ignoring the sender's chosen rate on a shared LAN.
             pace();
         }
-        // Re-announce the session and completion at most once a second.
+        // Re-announce at most once a second; same tick drops stale records.
         if (duration - lastFinishSendTime >= 1) {
             lastFinishSendTime = duration;
+            evictStaleResendRecords(duration);
             resendAnnounce();
             sendFinish();
         }

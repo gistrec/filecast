@@ -63,7 +63,10 @@ filecast receive
 ```
 
 The file is saved under the name the sender announced (pass a path to override
-it, e.g. `filecast receive my-photo.jpg`).
+it, e.g. `filecast receive my-photo.jpg`). The announced name is reduced to a
+plain base name in the working directory; one that cannot be stored safely — a
+path, a Windows device name, control bytes, invalid UTF-8 — falls back to
+`file.out`.
 
 Send to a specific host instead of broadcasting to the whole LAN:
 

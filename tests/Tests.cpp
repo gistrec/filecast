@@ -170,6 +170,72 @@ TEST(Protocol, SanitizeNameClampsLength) {
     EXPECT_EQ(Protocol::sanitizeName(exact), exact);
 }
 
+TEST(Protocol, ValidatesUtf8) {
+    for (const char* ok : {"", "plain ascii.txt", "отчёт.pdf", "日本語.txt",
+                           "emoji \xF0\x9F\x93\x81.zip"}) {
+        EXPECT_TRUE(Protocol::isValidUtf8(ok)) << ok;
+    }
+    // Invalid leads, stray/truncated continuations, overlong forms, a surrogate
+    // half and a value above U+10FFFF — what a Unicode filesystem rejects.
+    for (const char* bad : {"\xFF\xFE", "\x80", "\xC3", "\xE2\x82", "\xC0\xAF",
+                            "\xE0\x80\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80",
+                            "\xF5\x80\x80\x80"}) {
+        EXPECT_FALSE(Protocol::isValidUtf8(bad)) << bad;
+    }
+}
+
+TEST(Protocol, SanitizeNameRejectsInvalidUtf8) {
+    // macOS open() returns EILSEQ for such a name, so one ANNOUNCE used to stop
+    // a waiting receiver from creating its .part file at all.
+    EXPECT_EQ(Protocol::sanitizeName("bad\xFF\xFE.bin"), "file.out");
+    EXPECT_EQ(Protocol::sanitizeName("\xED\xA0\x80.txt"), "file.out");
+    // Valid non-ASCII names still come through untouched.
+    EXPECT_EQ(Protocol::sanitizeName("отчёт.pdf"), "отчёт.pdf");
+}
+
+TEST(Protocol, ClampUtf8KeepsCharactersWhole) {
+    // A name cut mid-sequence is invalid UTF-8, so both the sender's clamp and
+    // sanitizeName go through this helper.
+    EXPECT_EQ(Protocol::clampUtf8("abcdef", 10), "abcdef");
+    EXPECT_EQ(Protocol::clampUtf8("abcdef", 3), "abc");
+    // "é" is two bytes: a cut landing inside it drops the whole character.
+    EXPECT_EQ(Protocol::clampUtf8("abcé", 4), "abc");
+    EXPECT_EQ(Protocol::clampUtf8("abcé", 5), "abcé");
+    // Four-byte character, cut at every offset inside it.
+    const std::string emoji = "ab\xF0\x9F\x93\x81";
+    for (size_t max = 2; max < emoji.size(); ++max) {
+        EXPECT_EQ(Protocol::clampUtf8(emoji, max), "ab");
+        EXPECT_TRUE(Protocol::isValidUtf8(Protocol::clampUtf8(emoji, max)));
+    }
+    EXPECT_EQ(Protocol::clampUtf8(emoji, emoji.size()), emoji);
+}
+
+TEST(Protocol, SanitizeNameClampsOnCharacterBoundary) {
+    // "я" is two bytes: cutting mid-sequence would produce the very encoding
+    // the check above rejects.
+    std::string over;
+    while (over.size() < 400) over += "я";
+    std::string clamped = Protocol::sanitizeName(over);
+    EXPECT_LE(clamped.size(), Protocol::MAX_NAME_LEN);
+    EXPECT_GT(clamped.size(), Protocol::MAX_NAME_LEN - 2);
+    EXPECT_TRUE(Protocol::isValidUtf8(clamped));
+    EXPECT_EQ(clamped.size() % 2, 0u);
+}
+
+TEST(Utils, ClassifiesRecvErrors) {
+    // Only a real idle timeout may count against a loop's idle budget; unknown
+    // codes take the idle path so a broken socket still ends the loop.
+#if defined(_WIN32) || defined(_WIN64)
+    const int idle[] = {WSAETIMEDOUT, WSAENOTSOCK};
+    const int event[] = {WSAEMSGSIZE, WSAECONNRESET, WSAEINTR};
+#else
+    const int idle[] = {EAGAIN, EWOULDBLOCK, EBADF};
+    const int event[] = {EMSGSIZE, ECONNRESET, EINTR};
+#endif
+    for (int c : idle)  EXPECT_FALSE(Utils::isDatagramRecvError(c)) << c;
+    for (int c : event) EXPECT_TRUE(Utils::isDatagramRecvError(c)) << c;
+}
+
 TEST(Protocol, SanitizeNameRejectsControlBytes) {
     using std::string;
     // Embedded NUL: without this guard the name passes every other check but the
