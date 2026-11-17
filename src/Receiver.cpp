@@ -1226,6 +1226,12 @@ int dispatchPacket(char*& buf, size_t& bufcap, int64_t length, bool& finish) {
 
 // Returns a process exit code: 0 on success, non-zero on failure.
 int run() {
+    if (fileNameFromCli && !overwrite && fileExists(fileName)) {
+        std::cerr << "Error: output file " << fileName
+                  << " already exists (use --overwrite to replace it)" << std::endl;
+        return 2;
+    }
+
     bool finish = false; // Sender finished transferring
 
     size_t bufcap = std::max(static_cast<size_t>(2 * mtu), static_cast<size_t>(2048));
@@ -1233,13 +1239,6 @@ int run() {
     if (!buffer) {
         std::cerr << "Error: Can't allocate receive buffer" << std::endl;
         return 1;
-    }
-
-    if (fileNameFromCli && !overwrite && fileExists(fileName)) {
-        std::cerr << "Error: output file " << fileName
-                  << " already exists (use --overwrite to replace it)" << std::endl;
-        delete[] buffer;
-        return 2;
     }
 
     installSignalHandlers();
