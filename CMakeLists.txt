@@ -122,6 +122,16 @@ if(BUILD_TESTING)
             TIMEOUT 120
         )
 
+        # A receiver starting mid-stream must latch from an ANNOUNCE repeat.
+        add_test(
+            NAME e2e_latestart
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_latestart.sh
+        )
+        set_tests_properties(e2e_latestart PROPERTIES
+            ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>"
+            TIMEOUT 120
+        )
+
         # Lossy variant: a Python UDP proxy drops packets in both directions to
         # exercise the RESEND recovery branch. Skipped if Python 3 is missing.
         find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -200,8 +210,40 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 120
             )
+
+            # Forged ANNOUNCEs must not touch a .part/.part.idx we did not
+            # create (stray file, directory, real --resume snapshot).
+            add_test(
+                NAME e2e_partguard
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_partguard.sh
+            )
+            set_tests_properties(e2e_partguard PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
+
+            # Recovery past a burst longer than --ttl, a resumed receiver
+            # fed duplicates, and a lost FINISH.
+            add_test(
+                NAME e2e_recovery
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_recovery.sh
+            )
+            set_tests_properties(e2e_recovery PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 180
+            )
+
+            # What is kept, deleted and reported when a transfer does not complete.
+            add_test(
+                NAME e2e_snapshot
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_snapshot.sh
+            )
+            set_tests_properties(e2e_snapshot PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
-            message(STATUS "Python 3 not found — skipping e2e_lossy, e2e_corrupt, e2e_hijack, e2e_flood, e2e_prelatch and e2e_lostannounce tests")
+            message(STATUS "Python 3 not found — skipping the proxy-based e2e tests")
         endif()
     endif()
 endif()

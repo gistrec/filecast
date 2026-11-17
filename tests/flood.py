@@ -3,12 +3,16 @@
 # UDP flooder for the timeout-bound E2E tests (tests/e2e_flood.sh). It keeps a
 # target socket continuously busy so recvfrom never reports an idle read, which
 # is exactly the condition that used to keep filecast's receive/resend loops
-# alive forever. Two modes:
+# alive forever. Three modes:
 #
 #   garbage <host> <port> <duration>
 #       Blast tiny junk datagrams at host:port. Each is too short to be one of
 #       our packets (parseHeader -> NotOurs), so a correct receiver ignores them
 #       yet must still time out on its wall-clock deadline.
+#
+#   announce <host> <port> <duration>
+#       Blast well-formed ANNOUNCEs with an out-of-range chunk size. A correct
+#       receiver rejects them all, at a bounded warning rate.
 #
 #   resend <sniff_port> <target_host> <target_port> <duration>
 #       Listen on sniff_port for the sender's broadcasts to learn its (cleartext)
@@ -26,8 +30,10 @@ import time
 
 MAGIC = b"FCST"
 VERSION = 3
+TYPE_ANNOUNCE = 1
 TYPE_RESEND = 4
 HEADER_SIZE = 10  # magic(4) + version(1) + type(1) + session(4)
+ANNOUNCE_FIXED = HEADER_SIZE + 42  # + size(4) + chunk(4) + sha256(32) + name_len(2)
 
 # Burst size between clock checks: large enough to keep the socket buffer full on
 # loopback, small enough that the duration backstop stays responsive.
@@ -46,6 +52,24 @@ def garbage(host, port, duration):
         for _ in range(BURST):
             try:
                 s.sendto(b"x", (host, port))
+            except OSError:
+                pass  # transient ENOBUFS/EAGAIN under a heavy loopback flood
+
+
+def announce(host, port, duration):
+    # header + file_size(4) + chunk_size(4) + sha256(32) + name_len(2) + name,
+    # with a chunk size outside [MIN_CHUNK, MAX_CHUNK] so an unlatched receiver
+    # rejects every one; each rejection used to cost an stderr line.
+    name = b"evil"
+    pkt = (MAGIC + bytes([VERSION, TYPE_ANNOUNCE])
+           + struct.pack(">III", 0xDEADBEEF, 5000, 1) + bytes([0xAB]) * 32
+           + struct.pack(">H", len(name)) + name)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    deadline = time.time() + duration
+    while time.time() < deadline:
+        for _ in range(BURST):
+            try:
+                s.sendto(pkt, (host, port))
             except OSError:
                 pass  # transient ENOBUFS/EAGAIN under a heavy loopback flood
 
@@ -81,12 +105,14 @@ def resend(sniff_port, target_host, target_port, duration):
 
 def main(argv):
     if len(argv) < 2:
-        print("usage: flood.py garbage|resend ...", file=sys.stderr)
+        print("usage: flood.py garbage|announce|resend ...", file=sys.stderr)
         return 2
     mode = argv[1]
     try:
         if mode == "garbage":
             garbage(argv[2], int(argv[3]), float(argv[4]))
+        elif mode == "announce":
+            announce(argv[2], int(argv[3]), float(argv[4]))
         elif mode == "resend":
             resend(int(argv[2]), argv[3], int(argv[4]), float(argv[5]))
         else:

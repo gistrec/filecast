@@ -6,10 +6,14 @@
 # second", so any host sending faster than that froze the countdown. They now
 # key off a wall-clock deadline, so a flood still lets them give up.
 #
-# Two scenarios:
+# Scenarios:
 #   * receiver: junk flood -> the receiver must still time out (exit 2).
 #   * sender:   valid RESEND flood -> the sender must still stop at its absolute
 #               resend-phase deadline (exit 0), after actually serving resends.
+#   * recovery: junk flood during the RESEND phase -> the recovery loop must
+#               still give up on its deadline.
+#   * warnings: a flood of rejected ANNOUNCEs must be reported at a bounded
+#               rate, not one unbuffered stderr line per packet.
 #
 # Run via:
 #   ctest --test-dir build --output-on-failure
@@ -236,9 +240,42 @@ receiver_recovery_flood() {
     echo "PASS: [recovery] recovery loop timed out under a junk flood instead of hanging"
 }
 
+# Announcements the receiver must refuse used to cost one unbuffered stderr
+# line each (~366k for a two-second burst). The warning must survive the flood,
+# throttled, with a count of what it swallowed.
+receiver_warning_flood() {
+    local recv_bind=33608 rlog="$WORKDIR/warnflood-recv.log" warned
+
+    "$BINARY" receive "$WORKDIR/warnflood.bin" --to 127.0.0.1 \
+              --bind-port "$recv_bind" --port 33609 --ttl 3 --delay-ms 0 \
+              > "$rlog" 2>&1 &
+    PROC_PID=$!
+    sleep 0.5
+
+    "$PYTHON" "$SCRIPT_DIR/flood.py" announce 127.0.0.1 "$recv_bind" 2 \
+        > "$WORKDIR/flood-warn.log" 2>&1 &
+    FLOOD_PID=$!
+
+    local rc=0; wait "$PROC_PID" || rc=$?
+    PROC_PID=""
+    kill "$FLOOD_PID" 2>/dev/null || true; wait "$FLOOD_PID" 2>/dev/null || true
+    FLOOD_PID=""
+
+    [ "$rc" -eq 2 ] || { echo "FAIL: [warnings] expected exit 2, got $rc"; tail -5 "$rlog"; return 1; }
+    warned="$(grep -c "ignoring announcement with invalid file/chunk size" "$rlog" || true)"
+    # At least one line, and at most one per throttle window plus slack, against
+    # tens of thousands of packets in the same span.
+    { [ "$warned" -ge 1 ] && [ "$warned" -le 20 ]; } \
+        || { echo "FAIL: [warnings] $warned warning lines for one flood"; tail -5 "$rlog"; return 1; }
+    grep -q "more suppressed" "$rlog" \
+        || { echo "FAIL: [warnings] no suppressed count reported"; tail -5 "$rlog"; return 1; }
+    echo "PASS: [warnings] flood reported in $warned line(s), with a suppressed count"
+}
+
 receiver_garbage_flood
 sender_resend_flood
 receiver_recovery_flood
+receiver_warning_flood
 
 echo
 echo "All flood E2E tests passed."

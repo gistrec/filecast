@@ -487,5 +487,30 @@ run_small_mtu_test() {
 }
 run_small_mtu_test
 
+# The announced name is capped by the receiver's on-disk limit, not by --mtu, so
+# it arrives whole even at a tiny MTU — where the ANNOUNCE is then larger than
+# 2 * mtu, which the sender's own buffer has to allow for (it hears its own
+# broadcasts back).
+run_long_name_small_mtu_test() {
+    local dir="$WORKDIR/long-name" name
+    mkdir -p "$dir/src" "$dir/out"
+    name="$(printf 'n%.0s' $(seq 1 200)).bin"
+    dd if=/dev/urandom of="$dir/src/$name" bs=1024 count=8 status=none
+
+    echo "==> [long-name] 200-char name at --mtu 64"
+    ( cd "$dir/out" && exec "$BINARY" receive --to 127.0.0.1 \
+          --bind-port 33417 --port 33418 --ttl 5 --mtu 64 --delay-ms 0 > recv.log 2>&1 ) &
+    local rpid=$!
+    sleep 1
+    "$BINARY" send "$dir/src/$name" --to 127.0.0.1 --bind-port 33418 --port 33417 \
+              --ttl 2 --mtu 64 --delay-ms 0 > "$dir/send.log" 2>&1
+
+    wait "$rpid" || { echo "FAIL: [long-name] receiver exited non-zero"; tail -5 "$dir/out/recv.log"; return 1; }
+    cmp -s "$dir/src/$name" "$dir/out/$name" \
+        || { echo "FAIL: [long-name] name truncated or content differs"; ls "$dir/out"; return 1; }
+    echo "PASS: [long-name] full 200-char name delivered at --mtu 64"
+}
+run_long_name_small_mtu_test
+
 echo
 echo "All E2E tests passed."

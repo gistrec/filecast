@@ -111,6 +111,13 @@ bool sendPart(size_t part_index, bool* delivered = nullptr, int* send_errno = nu
     return true;
 }
 
+// Send/receive buffer size: a TRANSFER datagram and the largest ANNOUNCE must
+// both fit, since the socket hears our own broadcasts back.
+size_t bufferSize() {
+    return std::max(static_cast<size_t>(2 * mtu),
+                    Protocol::ANNOUNCE_FIXED + Protocol::MAX_NAME_LEN);
+}
+
 // Pause between packets to pace the transfer (0 = blast at full speed).
 void pace() {
     if (pace_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
@@ -179,14 +186,10 @@ bool sendAnnounce() {
     if (!hashInputFile(file_hash)) return false;
     if (verbose) std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
 
-    // Name the receiver saves under unless it was given an explicit output path.
-    // Clamp so the whole ANNOUNCE fits the send buffer (2 * mtu), the length
-    // field (a byte count well under 2^16), and the receiver's on-disk name cap
-    // (Protocol::MAX_NAME_LEN, which leaves room for the ".part.idx" suffix).
+    // Name the receiver saves under unless given an explicit output path,
+    // clamped to the receiver's on-disk cap.
     std::string name = baseName(fileName);
-    size_t max_name = static_cast<size_t>(2 * mtu) - Protocol::ANNOUNCE_FIXED;
-    if (max_name > Protocol::MAX_NAME_LEN) max_name = Protocol::MAX_NAME_LEN;
-    if (name.size() > max_name) name.resize(max_name);
+    name = Protocol::clampUtf8(name, Protocol::MAX_NAME_LEN);
 
     announce_packet.assign(Protocol::ANNOUNCE_FIXED + name.size(), 0);
     char* pkt = announce_packet.data();
@@ -234,6 +237,17 @@ void resendAnnounce() {
     }
 }
 
+// The rate limit looks one second back; evict older records so the map does
+// not grow with every part ever served.
+constexpr int64_t SENT_PART_RETAIN_SECONDS = 2;
+
+void evictStaleResendRecords(int64_t now) {
+    for (auto it = sent_part.begin(); it != sent_part.end(); ) {
+        if (now - it->second >= SENT_PART_RETAIN_SECONDS) it = sent_part.erase(it);
+        else ++it;
+    }
+}
+
 // Absolute ceiling on the whole resend-serving phase, expressed as a multiple of
 // ttl_max. The idle ttl already ends the phase once RESEND requests stop; this is
 // a backstop for a peer (buggy or hostile) that keeps sending valid RESENDs, each
@@ -260,18 +274,15 @@ bool serveResends(size_t total_parts, size_t& resent) {
     addr_len sender_address_length = sizeof(sender_address);
 
     while (ttl && std::chrono::steady_clock::now() < phase_deadline) {
-        // Read into the full buffer (2 * mtu). The socket is bound to the same
-        // port we broadcast to, so the OS also delivers copies of our own
-        // TRANSFER packets here; on Windows a 100-byte buffer made those
-        // oversized datagrams fail with WSAEMSGSIZE, which was misread as a
-        // timeout and prematurely drained ttl, killing the resend phase.
-        auto result = recvfrom(_socket, buffer, 2 * mtu, 0,
+        // Read into the full buffer: the socket also hears our own TRANSFER and
+        // ANNOUNCE broadcasts, and on Winsock an oversized datagram fails the read.
+        auto result = recvfrom(_socket, buffer, static_cast<int>(bufferSize()), 0,
                                reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
-        // Timeout (< 0): no requests this round, so re-announce FINISH and count ttl
-        // down. A zero-length datagram is a real event, not silence: ignore it so
-        // empty packets can't drain the resend phase early.
+        // Idle timeout: re-announce FINISH and count ttl down. A zero-length datagram
+        // or a per-datagram read error is an event, not silence.
         if (result < 0) {
+            if (Utils::isDatagramRecvError(Utils::lastRecvErrorCode())) continue;
             ttl--;
             resendAnnounce();
             sendFinish();
@@ -327,9 +338,10 @@ bool serveResends(size_t total_parts, size_t& resent) {
             // ignoring the sender's chosen rate on a shared LAN.
             pace();
         }
-        // Re-announce the session and completion at most once a second.
+        // Re-announce at most once a second; same tick drops stale records.
         if (duration - lastFinishSendTime >= 1) {
             lastFinishSendTime = duration;
+            evictStaleResendRecords(duration);
             resendAnnounce();
             sendFinish();
         }
@@ -366,7 +378,7 @@ int run() {
         return 1;
     }
 
-    buffer = new char[2 * mtu];
+    buffer = new char[bufferSize()];
 
     if (openInputFile() != 0) {
         delete[] buffer;
@@ -394,19 +406,22 @@ int run() {
     size_t delivered_parts = 0;
     int send_errno = 0;
 
-    // Repeat the ANNOUNCE across the first second of DATA, so one lost initial
-    // burst no longer strands every receiver.
+    // Repeat the ANNOUNCE densely across the first second, then once a second,
+    // so a receiver starting mid-stream still latches.
     constexpr std::chrono::milliseconds announce_repeat_at[] = {200ms, 500ms, 1000ms};
     constexpr size_t announce_repeats = sizeof(announce_repeat_at) / sizeof(announce_repeat_at[0]);
+    constexpr std::chrono::milliseconds announce_period = 1000ms;
     size_t announces_repeated = 0;
     const auto stream_start = std::chrono::steady_clock::now();
+    auto next_announce = stream_start + announce_repeat_at[0];
 
     for (size_t part_index = 0; part_index < total_parts; ++part_index) {
-        if (announces_repeated < announce_repeats &&
-            std::chrono::steady_clock::now() - stream_start >=
-                announce_repeat_at[announces_repeated]) {
+        if (std::chrono::steady_clock::now() >= next_announce) {
             resendAnnounce();
             ++announces_repeated;
+            next_announce = (announces_repeated < announce_repeats)
+                          ? stream_start + announce_repeat_at[announces_repeated]
+                          : next_announce + announce_period;
         }
         bool delivered = false;
         if (!sendPart(part_index, &delivered, &send_errno)) {
