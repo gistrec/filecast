@@ -122,6 +122,16 @@ if(BUILD_TESTING)
             TIMEOUT 120
         )
 
+        # A receiver starting mid-stream must latch from an ANNOUNCE repeat.
+        add_test(
+            NAME e2e_latestart
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_latestart.sh
+        )
+        set_tests_properties(e2e_latestart PROPERTIES
+            ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>"
+            TIMEOUT 120
+        )
+
         # Lossy variant: a Python UDP proxy drops packets in both directions to
         # exercise the RESEND recovery branch. Skipped if Python 3 is missing.
         find_package(Python3 COMPONENTS Interpreter QUIET)
