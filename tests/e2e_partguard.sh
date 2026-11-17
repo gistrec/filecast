@@ -34,14 +34,16 @@ reap() {
 # Three decoys at our names that the receiver did not create. Each must survive
 # a burst of foreign ANNOUNCEs byte-for-byte (the directory pins that cleanup
 # never rmdir's), and the announcement must be refused with a warning.
-for decoy in file dir orphan-idx; do
+for decoy in file dir orphan-idx unreadable-idx; do
     L="decoy-$decoy"; D="$W/$L"; mkdir -p "$D"
     case "$decoy" in
         file)       printf 'not ours\n' > "$D/out.bin.part";     V="$D/out.bin.part" ;;
         dir)        mkdir "$D/out.bin.part"; : > "$D/out.bin.part/keep"; V="$D/out.bin.part" ;;
-        orphan-idx) printf 'not ours\n' > "$D/out.bin.part.idx"; V="$D/out.bin.part.idx" ;;
+        orphan-idx|unreadable-idx)
+                    printf 'not ours\n' > "$D/out.bin.part.idx"; V="$D/out.bin.part.idx" ;;
     esac
     [ -d "$V" ] || cp "$V" "$D/orig"
+    if [ "$decoy" = unreadable-idx ]; then chmod 000 "$V"; fi
 
     echo "==> [$L] foreign ANNOUNCEs against $(basename "$V")"
     recv --ttl 3 --resume
@@ -49,6 +51,10 @@ for decoy in file dir orphan-idx; do
     reap
 
     [ "$rc" -eq 2 ] || die "expected timeout exit 2, got $rc"
+    if [ "$decoy" = unreadable-idx ]; then
+        [ -e "$V" ] || die "the unreadable index was deleted"
+        chmod 644 "$V"
+    fi
     if [ -d "$V" ]; then
         [ -f "$V/keep" ] || die "the directory at out.bin.part was removed"
     else

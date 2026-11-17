@@ -185,10 +185,13 @@ TEST(Protocol, ValidatesUtf8) {
 }
 
 TEST(Protocol, SanitizeNameRejectsInvalidUtf8) {
-    // macOS open() returns EILSEQ for such a name, so one ANNOUNCE used to stop
-    // a waiting receiver from creating its .part file at all.
+#if defined(_WIN32) || defined(_WIN64)
+    // A Windows receiver keeps the sender's ANSI code page bytes.
+    EXPECT_EQ(Protocol::sanitizeName("caf\xE9.txt"), "caf\xE9.txt");
+#else
     EXPECT_EQ(Protocol::sanitizeName("bad\xFF\xFE.bin"), "file.out");
     EXPECT_EQ(Protocol::sanitizeName("\xED\xA0\x80.txt"), "file.out");
+#endif
     // Valid non-ASCII names still come through untouched.
     EXPECT_EQ(Protocol::sanitizeName("отчёт.pdf"), "отчёт.pdf");
 }

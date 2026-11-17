@@ -111,10 +111,8 @@ bool sendPart(size_t part_index, bool* delivered = nullptr, int* send_errno = nu
     return true;
 }
 
-// Send/receive buffer size. A TRANSFER datagram (header + mtu) has to fit, and
-// so does the ANNOUNCE: the socket hears our own broadcasts back, and on Winsock
-// a datagram larger than the buffer fails the read (WSAEMSGSIZE), which
-// serveResends counts as an idle second and drains ttl.
+// Send/receive buffer size: a TRANSFER datagram and the largest ANNOUNCE must
+// both fit, since the socket hears our own broadcasts back.
 size_t bufferSize() {
     return std::max(static_cast<size_t>(2 * mtu),
                     Protocol::ANNOUNCE_FIXED + Protocol::MAX_NAME_LEN);
@@ -189,8 +187,7 @@ bool sendAnnounce() {
     if (verbose) std::cout << "Ok: sha256 " << Sha256::hex(file_hash) << std::endl;
 
     // Name the receiver saves under unless given an explicit output path,
-    // clamped to the receiver's on-disk cap. The ANNOUNCE has its own buffer,
-    // so --mtu does not bound it (a small --mtu used to truncate the name).
+    // clamped to the receiver's on-disk cap.
     std::string name = baseName(fileName);
     name = Protocol::clampUtf8(name, Protocol::MAX_NAME_LEN);
 
@@ -240,9 +237,8 @@ void resendAnnounce() {
     }
 }
 
-// The rate limit below looks one second back, so older records are dead
-// weight; evicting them keeps the map sized by the re-send rate rather than by
-// every distinct part the phase ever served (hundreds of MB on a large file).
+// The rate limit looks one second back; evict older records so the map does
+// not grow with every part ever served.
 constexpr int64_t SENT_PART_RETAIN_SECONDS = 2;
 
 void evictStaleResendRecords(int64_t now) {
@@ -278,17 +274,13 @@ bool serveResends(size_t total_parts, size_t& resent) {
     addr_len sender_address_length = sizeof(sender_address);
 
     while (ttl && std::chrono::steady_clock::now() < phase_deadline) {
-        // Read into the full buffer. The socket is bound to the same port we
-        // broadcast to, so the OS also delivers copies of our own TRANSFER and
-        // ANNOUNCE packets here; on Windows a datagram larger than the buffer
-        // fails with WSAEMSGSIZE, which is misread as a timeout and drains ttl.
+        // Read into the full buffer: the socket also hears our own TRANSFER and
+        // ANNOUNCE broadcasts, and on Winsock an oversized datagram fails the read.
         auto result = recvfrom(_socket, buffer, static_cast<int>(bufferSize()), 0,
                                reinterpret_cast<sockaddr*>(&sender_address), &sender_address_length);
 
-        // Idle timeout: no requests this round, so re-announce FINISH and count
-        // ttl down. A zero-length datagram, or a read that failed because of the
-        // datagram rather than the wait (Winsock WSAEMSGSIZE/WSAECONNRESET),
-        // is an event, not silence — counting it drained ttl in milliseconds.
+        // Idle timeout: re-announce FINISH and count ttl down. A zero-length datagram
+        // or a per-datagram read error is an event, not silence.
         if (result < 0) {
             if (Utils::isDatagramRecvError(Utils::lastRecvErrorCode())) continue;
             ttl--;
@@ -414,9 +406,8 @@ int run() {
     size_t delivered_parts = 0;
     int send_errno = 0;
 
-    // Repeat the ANNOUNCE densely across the first second, then once a second
-    // until FINISH, so a receiver starting mid-stream still latches and
-    // recovers via RESEND instead of timing out on un-announced data.
+    // Repeat the ANNOUNCE densely across the first second, then once a second,
+    // so a receiver starting mid-stream still latches.
     constexpr std::chrono::milliseconds announce_repeat_at[] = {200ms, 500ms, 1000ms};
     constexpr size_t announce_repeats = sizeof(announce_repeat_at) / sizeof(announce_repeat_at[0]);
     constexpr std::chrono::milliseconds announce_period = 1000ms;

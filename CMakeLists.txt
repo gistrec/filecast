@@ -232,6 +232,16 @@ if(BUILD_TESTING)
                 ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
                 TIMEOUT 180
             )
+
+            # What is kept, deleted and reported when a transfer does not complete.
+            add_test(
+                NAME e2e_snapshot
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_snapshot.sh
+            )
+            set_tests_properties(e2e_snapshot PROPERTIES
+                ENVIRONMENT "BINARY=$<TARGET_FILE:filecast>;PYTHON=${Python3_EXECUTABLE}"
+                TIMEOUT 120
+            )
         else()
             message(STATUS "Python 3 not found — skipping the proxy-based e2e tests")
         endif()

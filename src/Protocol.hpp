@@ -171,11 +171,8 @@ inline bool hasControlChar(const std::string& name) {
     });
 }
 
-// Is the name well-formed UTF-8? A filesystem that stores names as Unicode
-// refuses an invalid sequence (macOS open() fails with EILSEQ), so one such
-// ANNOUNCE stopped a waiting receiver from creating its .part file at all.
-// Checked strictly per RFC 3629: the overlong forms, surrogate halves and
-// values above U+10FFFF are exactly what those filesystems reject.
+// Unicode filesystems refuse an invalid sequence (macOS open() fails with
+// EILSEQ), so validate strictly per RFC 3629.
 inline bool isValidUtf8(const std::string& name) {
     const size_t n = name.size();
     auto at = [&](size_t k) { return static_cast<unsigned char>(name[k]); };
@@ -207,9 +204,7 @@ inline bool isValidUtf8(const std::string& name) {
 // over-long ANNOUNCE aimed at a still-waiting receiver.
 constexpr size_t MAX_NAME_LEN = 255 - 9;  // room for the ".part.idx" suffix
 
-// Shorten `name` to at most `max` bytes without splitting a character: cutting
-// mid-sequence would produce exactly the invalid encoding isValidUtf8 rejects,
-// so both ends of the wire clamp through here.
+// Shorten `name` to at most `max` bytes without splitting a UTF-8 character.
 inline std::string clampUtf8(std::string name, size_t max) {
     if (name.size() <= max) return name;
     size_t cut = max;
@@ -229,7 +224,11 @@ inline std::string sanitizeName(const std::string& raw) {
     if (name.empty() || name == "." || name == "..") return "file.out";
     if (name.find(':') != std::string::npos) return "file.out";
     if (hasControlChar(name)) return "file.out";
+    // Windows names travel in the sender's ANSI code page, which a Windows
+    // receiver stores as-is; only Unicode filesystems refuse a non-UTF-8 name.
+    #if !defined(_WIN32) && !defined(_WIN64)
     if (!isValidUtf8(name)) return "file.out";
+    #endif
     if (isReservedDeviceName(name)) return "file.out";
     name = clampUtf8(name, MAX_NAME_LEN);
     if (name.empty()) return "file.out";

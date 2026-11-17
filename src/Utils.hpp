@@ -44,7 +44,6 @@ namespace Utils {
      * return false and take the idle path, so a broken socket cannot spin.
      */
     inline bool isDatagramRecvError(int code) {
-        // Everything else, WSAETIMEDOUT and EAGAIN included, takes the idle path.
 #if defined(_WIN32) || defined(_WIN64)
         return code == WSAEINTR || code == WSAEMSGSIZE || code == WSAECONNRESET ||
                code == WSAENETRESET || code == WSAECONNREFUSED ||
