@@ -11,7 +11,7 @@ endif()
 
 # Version string baked into the binary; the release workflow overrides this
 # from the git tag (e.g. -DFILECAST_VERSION=v1.1.0).
-set(FILECAST_VERSION "1.1.0" CACHE STRING "Version string for --version output")
+set(FILECAST_VERSION "1.2.0" CACHE STRING "Version string for --version output")
 
 # --- main executable ---------------------------------------------------------
 
